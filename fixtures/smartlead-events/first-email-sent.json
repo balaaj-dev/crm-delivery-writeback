@@ -1,0 +1,19 @@
+{
+  "event_type": "FIRST_EMAIL_SENT",
+  "event_id": "evt_first_email_sent_001",
+  "event_timestamp": "2026-08-18T09:00:00.000Z",
+  "campaign_id": "camp_100",
+  "campaign_name": "Acme Robotics — Q3 Outbound",
+  "sequence_number": 1,
+  "subject": "Quick question about your ops stack",
+  "email_body": "Hi Jordan, saw that Blake Manufacturing recently...",
+  "lead": {
+    "id": "lead_001",
+    "email": "jordan.blake@example.com",
+    "first_name": "Jordan",
+    "last_name": "Blake",
+    "company_name": "Blake Manufacturing",
+    "job_title": "VP Operations",
+    "phone_number": "+1-555-0101"
+  }
+}

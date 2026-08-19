@@ -1,0 +1,20 @@
+{
+  "event_type": "LEAD_CATEGORY_UPDATED",
+  "event_id": "evt_category_meeting_booked_001",
+  "event_timestamp": "2026-08-20T10:00:00.000Z",
+  "campaign_id": "camp_101",
+  "campaign_name": "Northwind Labs — Full Sync",
+  "lead_category": {
+    "id": "cat_meeting_booked",
+    "name": "Meeting Booked"
+  },
+  "lead": {
+    "id": "lead_005",
+    "email": "morgan.lee@example.com",
+    "first_name": "Morgan",
+    "last_name": "Lee",
+    "company_name": "Lee Industrial",
+    "job_title": "Director of Supply Chain",
+    "phone_number": "+1-555-0199"
+  }
+}

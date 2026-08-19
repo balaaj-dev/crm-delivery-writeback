@@ -1,0 +1,17 @@
+{
+  "event_type": "EMAIL_BOUNCE",
+  "event_id": "evt_email_bounce_001",
+  "event_timestamp": "2026-08-19T14:05:00.000Z",
+  "campaign_id": "camp_100",
+  "campaign_name": "Acme Robotics — Q3 Outbound",
+  "sequence_number": 1,
+  "bounce_reason": "550 5.1.1 no such user",
+  "lead": {
+    "id": "lead_003",
+    "email": "no-longer-here@example.com",
+    "first_name": "Sam",
+    "last_name": "Ito",
+    "company_name": "Ito Holdings",
+    "job_title": "Procurement Lead"
+  }
+}

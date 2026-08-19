@@ -1,0 +1,18 @@
+{
+  "event_type": "UNTRACKED_REPLIES",
+  "event_id": "evt_untracked_reply_001",
+  "event_timestamp": "2026-08-19T16:10:00.000Z",
+  "campaign_id": "camp_101",
+  "campaign_name": "Northwind Labs — Full Sync",
+  "sequence_number": 1,
+  "subject": "RE: Quick question",
+  "email_body": "Please remove me from this list, wrong department.",
+  "lead": {
+    "id": "lead_002",
+    "email": "priya.nair@example.com",
+    "first_name": "Priya",
+    "last_name": "Nair",
+    "company_name": "Northwind Labs",
+    "job_title": "Office Manager"
+  }
+}

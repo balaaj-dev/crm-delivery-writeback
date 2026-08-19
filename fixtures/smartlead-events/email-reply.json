@@ -1,0 +1,19 @@
+{
+  "event_type": "EMAIL_REPLY",
+  "event_id": "evt_email_reply_001",
+  "event_timestamp": "2026-08-19T15:30:00.000Z",
+  "campaign_id": "camp_100",
+  "campaign_name": "Acme Robotics — Q3 Outbound",
+  "sequence_number": 2,
+  "subject": "RE: Following up on robotics ops",
+  "email_body": "Thanks for reaching out, can you send more info?",
+  "lead": {
+    "id": "lead_001",
+    "email": "jordan.blake@example.com",
+    "first_name": "Jordan",
+    "last_name": "Blake",
+    "company_name": "Blake Manufacturing",
+    "job_title": "VP Operations",
+    "phone_number": "+1-555-0101"
+  }
+}

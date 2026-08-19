@@ -1,0 +1,159 @@
+[
+  {
+    "clientId": "rec_acme_robotics",
+    "clientName": "Acme Robotics (fixture)",
+    "activated": true,
+    "mode": "partial",
+    "source": {
+      "platform": "smartlead",
+      "apiKey": "fixture-smartlead-key-acme",
+      "smartleadClientId": "sl_client_acme",
+      "campaignIds": []
+    },
+    "crm": {
+      "type": "hubspot",
+      "integrationPath": "native",
+      "credentials": {
+        "accessToken": "fixture-hubspot-private-app-token"
+      }
+    },
+    "behaviour": {
+      "createRecordOnInterestedReply": true,
+      "createRecordForAllLeads": false,
+      "createDeal": false,
+      "planLimitAcknowledged": false
+    },
+    "events": {
+      "email_sent": false,
+      "reply": true,
+      "positive_reply": true,
+      "bounce": true,
+      "unsubscribe": true,
+      "status_change": true,
+      "meeting_booked": true
+    },
+    "fieldMap": [
+      { "canonical": "prospect.email", "crmObject": "contact", "crmField": "email", "direction": "out" },
+      { "canonical": "prospect.firstName", "crmObject": "contact", "crmField": "firstname", "direction": "out" },
+      { "canonical": "prospect.lastName", "crmObject": "contact", "crmField": "lastname", "direction": "out" },
+      { "canonical": "prospect.company", "crmObject": "contact", "crmField": "company", "direction": "out" },
+      { "canonical": "prospect.title", "crmObject": "contact", "crmField": "jobtitle", "direction": "out" },
+      { "canonical": "prospect.phone", "crmObject": "contact", "crmField": "phone", "direction": "out" }
+    ],
+    "statusMap": {
+      "Interested": "positive_reply",
+      "Meeting Booked": "meeting_booked",
+      "Not Interested": "closed_lost",
+      "Not Now": "nurture",
+      "Wrong Person": "referral",
+      "Out Of Office": "ignore",
+      "Do Not Contact": "unsubscribed"
+    },
+    "notifications": {
+      "slackExternalId": "C_FIXTURE_ACME_EXT",
+      "slackInternalId": "C_FIXTURE_ACME_INT",
+      "slackNotificationsId": "C_FIXTURE_ACME_ALERTS"
+    }
+  },
+  {
+    "clientId": "rec_northwind_labs",
+    "clientName": "Northwind Labs (fixture)",
+    "activated": true,
+    "mode": "full",
+    "source": {
+      "platform": "smartlead",
+      "apiKey": "fixture-smartlead-key-northwind",
+      "smartleadClientId": "sl_client_northwind",
+      "campaignIds": []
+    },
+    "crm": {
+      "type": "hubspot",
+      "integrationPath": "native",
+      "credentials": {
+        "accessToken": "fixture-hubspot-private-app-token-northwind"
+      }
+    },
+    "behaviour": {
+      "createRecordOnInterestedReply": true,
+      "createRecordForAllLeads": true,
+      "createDeal": true,
+      "dealStageOnCreate": "appointmentscheduled",
+      "planLimitAcknowledged": true
+    },
+    "events": {
+      "email_sent": true,
+      "reply": true,
+      "positive_reply": true,
+      "bounce": true,
+      "unsubscribe": true,
+      "status_change": true,
+      "meeting_booked": true
+    },
+    "fieldMap": [
+      { "canonical": "prospect.email", "crmObject": "contact", "crmField": "email", "direction": "out" },
+      { "canonical": "prospect.firstName", "crmObject": "contact", "crmField": "firstname", "direction": "out" },
+      { "canonical": "prospect.lastName", "crmObject": "contact", "crmField": "lastname", "direction": "out" },
+      { "canonical": "prospect.company", "crmObject": "contact", "crmField": "company", "direction": "out" },
+      { "canonical": "prospect.title", "crmObject": "contact", "crmField": "jobtitle", "direction": "out" },
+      { "canonical": "prospect.phone", "crmObject": "contact", "crmField": "phone", "direction": "out" }
+    ],
+    "statusMap": {
+      "Interested": "positive_reply",
+      "Meeting Booked": "meeting_booked",
+      "Not Interested": "closed_lost",
+      "Not Now": "nurture",
+      "Wrong Person": "referral",
+      "Out Of Office": "ignore",
+      "Do Not Contact": "unsubscribed"
+    },
+    "notifications": {
+      "slackExternalId": "C_FIXTURE_NORTHWIND_EXT",
+      "slackInternalId": "C_FIXTURE_NORTHWIND_INT",
+      "slackNotificationsId": "C_FIXTURE_NORTHWIND_ALERTS"
+    }
+  },
+  {
+    "clientId": "rec_blue_mantis",
+    "clientName": "Blue Mantis (fixture)",
+    "activated": true,
+    "mode": "full",
+    "source": {
+      "platform": "smartlead",
+      "apiKey": "fixture-smartlead-key-bluemantis",
+      "smartleadClientId": "sl_client_bluemantis",
+      "campaignIds": []
+    },
+    "crm": {
+      "type": "salesforce",
+      "integrationPath": "outboundsync",
+      "credentials": {}
+    },
+    "behaviour": {
+      "createRecordOnInterestedReply": true,
+      "createRecordForAllLeads": true,
+      "createDeal": false,
+      "planLimitAcknowledged": true
+    },
+    "events": {
+      "email_sent": true,
+      "reply": true,
+      "positive_reply": true,
+      "bounce": true,
+      "unsubscribe": true,
+      "status_change": true,
+      "meeting_booked": true
+    },
+    "fieldMap": [
+      { "canonical": "prospect.email", "crmObject": "contact", "crmField": "email", "direction": "out" }
+    ],
+    "statusMap": {
+      "Interested": "positive_reply",
+      "Meeting Booked": "meeting_booked"
+    },
+    "notifications": {
+      "slackExternalId": "C_FIXTURE_BLUEMANTIS_EXT",
+      "slackInternalId": "C_FIXTURE_BLUEMANTIS_INT",
+      "slackNotificationsId": "C_FIXTURE_BLUEMANTIS_ALERTS"
+    }
+  }
+]

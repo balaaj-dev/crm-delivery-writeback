@@ -1,0 +1,20 @@
+{
+  "event_type": "LEAD_CATEGORY_UPDATED",
+  "event_id": "evt_category_interested_001",
+  "event_timestamp": "2026-08-19T15:35:00.000Z",
+  "campaign_id": "camp_100",
+  "campaign_name": "Acme Robotics — Q3 Outbound",
+  "lead_category": {
+    "id": "cat_interested",
+    "name": "Interested"
+  },
+  "lead": {
+    "id": "lead_001",
+    "email": "jordan.blake@example.com",
+    "first_name": "Jordan",
+    "last_name": "Blake",
+    "company_name": "Blake Manufacturing",
+    "job_title": "VP Operations",
+    "phone_number": "+1-555-0101"
+  }
+}

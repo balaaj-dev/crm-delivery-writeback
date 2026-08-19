@@ -1,0 +1,15 @@
+{
+  "event_type": "LEAD_UNSUBSCRIBED",
+  "event_id": "evt_unsubscribed_001",
+  "event_timestamp": "2026-08-19T17:00:00.000Z",
+  "campaign_id": "camp_101",
+  "campaign_name": "Northwind Labs — Full Sync",
+  "lead": {
+    "id": "lead_004",
+    "email": "unsubscriber@example.com",
+    "first_name": "Casey",
+    "last_name": "Wren",
+    "company_name": "Wren & Co",
+    "job_title": "Founder"
+  }
+}

@@ -1,0 +1,154 @@
+/**
+ * The decision layer between a canonical event and a CRM adapter call
+ * (brief §8). Pure and unit-testable: takes the adapter as a parameter
+ * rather than resolving it itself, so tests can pass lib/adapters/mock.ts
+ * directly without touching env vars or the registry.
+ *
+ * Every skip is logged with a machine-readable reason. Silent drops are the
+ * failure mode this whole service exists to prevent — no_record_no_create_policy
+ * in particular will be common in partial mode and must be visible, not hidden.
+ */
+import type {
+  CanonicalEvent,
+  CanonicalEventType,
+  ClientConfig,
+  CrmAdapter,
+  DispatchOutcome,
+} from './types';
+import { hasBeenProcessed, markProcessed } from './idempotency';
+import { recordEvent } from './log';
+import { isDryRun } from './adapters/index';
+
+/** category/status-map values that, when matched, promote a status_change event to that type. */
+const PROMOTABLE_TYPES: CanonicalEventType[] = ['positive_reply', 'meeting_booked'];
+
+/**
+ * LEAD_CATEGORY_UPDATED always normalises to 'status_change' in
+ * lib/sources/smartlead.ts, since that mapper is client-agnostic. Whether a
+ * given category counts as a positive_reply / meeting_booked for dispatch
+ * (config.events toggles) or "just" a generic status_change is a per-client
+ * decision, driven by the client's own statusMap (brief §7.5, §6.1) — a
+ * category whose mapped value is itself one of the two special canonical
+ * types gets promoted for the purposes of the event-toggle check below.
+ */
+export function resolveEffectiveEventType(
+  event: CanonicalEvent,
+  cfg: ClientConfig,
+): CanonicalEventType {
+  if (event.type !== 'status_change' || !event.detail.category) return event.type;
+  const mapped = cfg.statusMap[event.detail.category];
+  if (mapped && (PROMOTABLE_TYPES as string[]).includes(mapped)) {
+    return mapped as CanonicalEventType;
+  }
+  return event.type;
+}
+
+// Tracks which CRM record refs have already had a deal created in this
+// process, so a repeated positive_reply/meeting_booked doesn't spawn a
+// second deal. Resets on cold start — same limitation as idempotency.ts,
+// documented in docs/HANDOVER.md; production needs a persistent store.
+const dealsCreatedForRef = new Set<string>();
+
+/** Test-only escape hatch so unit tests get a clean store per test. */
+export function resetDealDedupeStore(): void {
+  dealsCreatedForRef.clear();
+}
+
+export async function dispatchEvent(
+  event: CanonicalEvent,
+  cfg: ClientConfig,
+  adapter: CrmAdapter,
+): Promise<DispatchOutcome> {
+  const dryRun = isDryRun();
+  const baseLog = {
+    timestamp: new Date().toISOString(),
+    clientId: cfg.clientId,
+    clientName: cfg.clientName,
+    eventType: event.type,
+    eventId: event.eventId,
+    dryRun,
+  };
+
+  // 1. not activated
+  if (!cfg.activated) {
+    await recordEvent({ ...baseLog, outcome: 'skip', reason: 'not_activated' });
+    return { status: 'skip', reason: 'not_activated' };
+  }
+
+  const effectiveType = resolveEffectiveEventType(event, cfg);
+
+  // 2. event type disabled for this client
+  if (!cfg.events[effectiveType]) {
+    await recordEvent({ ...baseLog, outcome: 'skip', reason: 'event_disabled' });
+    return { status: 'skip', reason: 'event_disabled' };
+  }
+
+  // 3. campaign scoping
+  const scopedCampaigns = cfg.source.campaignIds ?? [];
+  if (scopedCampaigns.length > 0 && !scopedCampaigns.includes(event.campaign.id)) {
+    await recordEvent({ ...baseLog, outcome: 'skip', reason: 'campaign_not_in_scope' });
+    return { status: 'skip', reason: 'campaign_not_in_scope' };
+  }
+
+  // 4. idempotency
+  if (hasBeenProcessed(event.eventId)) {
+    await recordEvent({ ...baseLog, outcome: 'skip', reason: 'duplicate' });
+    return { status: 'skip', reason: 'duplicate' };
+  }
+  markProcessed(event.eventId);
+
+  try {
+    // 5. find existing record
+    let ref = await adapter.findRecord(event.prospect.email, cfg);
+    const actions: string[] = [];
+
+    if (!ref) {
+      // 6. may we create?
+      const isInterestedSignal = effectiveType === 'positive_reply' || effectiveType === 'meeting_booked';
+      const canCreateOnInterested = isInterestedSignal && cfg.behaviour.createRecordOnInterestedReply;
+      const canCreateForAllLeads =
+        cfg.behaviour.createRecordForAllLeads && cfg.behaviour.planLimitAcknowledged;
+
+      if (!canCreateOnInterested && !canCreateForAllLeads) {
+        await recordEvent({ ...baseLog, outcome: 'skip', reason: 'no_record_no_create_policy' });
+        return { status: 'skip', reason: 'no_record_no_create_policy' };
+      }
+
+      ref = await adapter.createRecord(event, cfg);
+      actions.push('created_record');
+    }
+
+    // 7. write activity
+    await adapter.writeActivity(ref, event, cfg);
+    actions.push('wrote_activity');
+
+    // 8. status map
+    const category = event.detail.category;
+    const statusValue = category ? cfg.statusMap[category] : undefined;
+    if (statusValue) {
+      await adapter.updateStatus(ref, statusValue, cfg);
+      actions.push(`updated_status:${statusValue}`);
+    }
+
+    // 9. deal creation
+    const isDealSignal = effectiveType === 'positive_reply' || effectiveType === 'meeting_booked';
+    if (
+      cfg.behaviour.createDeal &&
+      isDealSignal &&
+      adapter.createDeal &&
+      !dealsCreatedForRef.has(ref.id)
+    ) {
+      await adapter.createDeal(ref, event, cfg);
+      dealsCreatedForRef.add(ref.id);
+      actions.push('created_deal');
+    }
+
+    // 10. log success
+    await recordEvent({ ...baseLog, outcome: 'success', detail: { ref, actions } });
+    return { status: 'success', ref, actions };
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    await recordEvent({ ...baseLog, outcome: 'error', reason });
+    return { status: 'error', reason };
+  }
+}
