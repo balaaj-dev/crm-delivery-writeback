@@ -17,8 +17,8 @@
 npm-debug.log*
 *.log
 
-# runtime event log (append-only JSON, local demo state)
-/data/event-log.jsonl
+# local demo state (event log, client config overrides) — never commit
+/data/
 
 # misc
 .DS_Store

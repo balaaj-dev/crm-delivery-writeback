@@ -9,6 +9,8 @@
  *   CONFIRMED    Base URL is https://server.smartlead.ai/api/v1/ (NOT
  *                api.smartlead.ai — that host serves the docs, not the API).
  *   CONFIRMED    Auth is an `api_key` query parameter, not a bearer token.
+ *   CONFIRMED    GET /campaigns/ lists a workspace's campaigns (used for the
+ *                wizard's campaign-selection step).
  *   NOT CONFIRMED  The exact path for listing lead categories.
  *   NOT CONFIRMED  The exact path/payload shape for webhook registration.
  *
@@ -25,6 +27,32 @@ const SMARTLEAD_API_BASE = 'https://server.smartlead.ai/api/v1';
 export interface SmartleadLeadCategory {
   id: string | number;
   name: string;
+}
+
+export interface SmartleadCampaign {
+  id: string;
+  name: string;
+  status: string;
+}
+
+/**
+ * Confirmed live against Smartlead's public API reference (19 Aug 2026):
+ * GET https://server.smartlead.ai/api/v1/campaigns/ — returns a plain array
+ * of campaign objects. Powers the wizard's campaign-selection step, which
+ * previously didn't exist at all (see docs/HANDOVER.md — without it,
+ * source.campaignIds always stayed empty and webhook registration had no
+ * way to succeed).
+ */
+export async function listCampaigns(apiKey: string): Promise<SmartleadCampaign[]> {
+  const url = new URL(`${SMARTLEAD_API_BASE}/campaigns/`);
+  url.searchParams.set('api_key', apiKey);
+
+  const res = await fetch(url);
+  if (!res.ok) {
+    throw new Error(`Smartlead list-campaigns call failed (${res.status}): ${await res.text()}`);
+  }
+  const body = (await res.json()) as Array<{ id: number | string; name: string; status: string }>;
+  return body.map((c) => ({ id: String(c.id), name: c.name, status: c.status }));
 }
 
 /**

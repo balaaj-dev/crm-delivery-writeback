@@ -49,14 +49,29 @@ filling in Airtable fields, not writing code.
   what to add by hand; until then, every client resolves to `activated: false` via
   `lib/airtable.ts`'s safe defaults, and `fixtures/clients.json` is what actually exercises the
   app end-to-end.
-- **The wizard never collects `source.campaignIds`.** Neither the build brief's §13 step list nor
-  this implementation has a step for picking which Smartlead campaigns to sync — `runBuild()` in
-  `app/setup/page.tsx` just carries over whatever `campaignIds` the client's existing config
-  already has (empty for every fixture). `POST /api/webhooks/register` requires a non-empty list
-  and fails cleanly with a clear message when it's empty, so this doesn't fail silently — but it
-  does mean a CSM can walk through all 10 steps and hit a dead end at "Review and build" with no
-  way to fix it from the UI. Needs a new step: fetch the client's live Smartlead campaigns and let
-  the CSM multi-select them.
+- **Fixed — campaign selection.** The wizard is now 11 steps; step 3 fetches the client's live
+  Smartlead campaigns (`lib/sources/smartlead-api.ts`'s `listCampaigns`, confirmed against a real
+  endpoint) and lets the CSM multi-select which ones this client's writeback covers, wiring the
+  result into `source.campaignIds`. Falls back cleanly (no campaigns shown, Next stays enabled) if
+  the fetch fails, same graceful-degradation pattern as the categories/fields steps.
+- **Config-source-agnostic session override for wizard-configured values** (`lib/config.ts`'s
+  `setSessionOverride`/`applySessionOverrides`, backed by a local JSON file at
+  `data/client-overrides.json`, gitignored). Fixes a real bug found live: neither
+  `fixtures/clients.json` (a static committed file) nor Airtable (write-back is a stub — see
+  above) could actually persist what the wizard configures, so the wizard's own "fire a test
+  event" step silently ran against stale data instead of what had just been selected — confirmed
+  live with a deal-stage choice that was completely ignored. The first fix attempt used an
+  in-memory `Map` and **did not work** — confirmed live that Next.js dev mode compiles different
+  API route files as separate on-demand bundles, each getting its own independent instance of
+  `lib/config.ts`'s top-level state, so a value set by the PUT route was invisible to
+  `/api/webhooks/smartlead`'s route. This isn't dev-mode-only either: Vercel typically runs each
+  API route as its own serverless function in production, so in-memory cross-route state would
+  fail there for the same underlying reason (separate execution contexts), just with a different
+  mechanism. The filesystem doesn't have this problem — any route reading/writing the same path
+  sees the same data. Same "doesn't survive Vercel's read-only fs" caveat as `lib/log.ts`'s file
+  mirror; this is a local-testing convenience, not a production persistence layer. **Takeaway for
+  anything added later that needs cross-route shared state in this codebase: do not use a bare
+  module-level variable — use the filesystem (locally) or a real store (in production).**
 
 ## Design decision: how DRY_RUN actually routes calls (deviates from a literal reading of brief §11)
 
@@ -108,13 +123,20 @@ actual objects from HubSpot's API afterward, not just by reading a 200 response:
   originally set `dealStageOnCreate: "appointmentscheduled"` — a real stage ID from HubSpot's
   classic default pipeline — but this test portal's default pipeline uses raw numeric stage IDs
   instead (confirmed live via the resulting `INVALID_OPTION` error, which usefully lists the
-  portal's actual valid IDs). Fixed by removing the hardcoded value from
-  `fixtures/clients.json` — omitting `dealStageOnCreate` lets HubSpot fall back to the pipeline's
-  own default stage, which is the more portable choice for a general-purpose fixture. **For any
-  real client**, whoever fills in "Deal Stage On Create" in the wizard needs that client's actual
-  stage ID from their HubSpot pipeline, not a guessed name — the wizard doesn't currently fetch
-  and offer real pipeline stages as options (gap; would be a good addition alongside the field-
-  mapping step, which already does this pattern for contact properties).
+  portal's actual valid IDs). Fixed by removing the hardcoded value from `fixtures/clients.json`.
+- **Fixed — deal-stage picker.** Wizard step 10 now fetches the client's real pipeline stages
+  (`CrmAdapter.listDealStages`, `GET /crm/v3/pipelines/deals`) and offers them by name instead of
+  requiring a raw ID. Needs its own scope, confirmed live: `crm.objects.deals.read` (or
+  `crm.schemas.deals.read`) — separate from `crm.objects.deals.write`, which alone is enough to
+  create deals but not to list pipeline stages. Falls back to a plain text field if the fetch
+  fails (missing scope, etc.), same graceful-degradation pattern used elsewhere.
+- **HubSpot silently drops `dealstage` on create unless `pipeline` is sent alongside it** — no
+  error, the property just comes back `null`. Confirmed live by isolating it with a raw API call:
+  sending `dealstage` alone → `null` on read-back; sending `pipeline` + `dealstage` together →
+  sticks correctly. `createDeal` in `lib/adapters/hubspot.ts` now resolves which pipeline a chosen
+  stage belongs to (via the same pipelines endpoint the picker uses) and sends both. If a
+  configured `dealStageOnCreate` can't be matched to any pipeline (e.g. a stale/hand-typed ID),
+  it logs a warning and sends `dealstage` alone rather than blocking deal creation entirely.
 - **Confirmed working end-to-end, real objects verified via GET afterward:** `findRecord` (real
   404 → not-found), `createRecord` (contact created with correct field-mapped properties),
   `writeActivity` (note created **and** correctly associated to the contact via the v4 default

@@ -253,6 +253,22 @@ export interface CrmFieldDescriptor {
   options?: string[];
 }
 
+export interface CrmDealStageDescriptor {
+  /** The real, portal-specific stage ID — what actually gets written to dealStageOnCreate. */
+  id: string;
+  /** Human label for the wizard's picker, e.g. "Appointment Scheduled". */
+  label: string;
+  /** Which pipeline this stage belongs to, shown when a portal has more than one. */
+  pipelineLabel: string;
+  /**
+   * The pipeline's own ID. HubSpot silently drops `dealstage` on create
+   * unless `pipeline` is sent alongside it (confirmed live, 25 Aug 2026 —
+   * no error, the value just comes back null) — createDeal needs this to
+   * set a stage correctly.
+   */
+  pipelineId: string;
+}
+
 export interface CrmAdapter {
   readonly type: CrmType;
   readonly integrationPath: IntegrationPath;
@@ -274,6 +290,15 @@ export interface CrmAdapter {
 
   /** Powers the wizard's field-mapping step. */
   describeFields(cfg: ClientConfig, objectType: string): Promise<CrmFieldDescriptor[]>;
+
+  /**
+   * Optional — only implement for CRMs with a deal/opportunity pipeline
+   * concept. Powers the wizard's deal-stage picker (step 9) so a CSM
+   * chooses a real stage by name instead of typing a raw, portal-specific
+   * ID (see docs/HANDOVER.md — HubSpot's default pipeline stage IDs vary
+   * per portal, confirmed live).
+   */
+  listDealStages?(cfg: ClientConfig): Promise<CrmDealStageDescriptor[]>;
 
   /** Credential check for the wizard. */
   testConnection(cfg: ClientConfig): Promise<{ ok: boolean; message: string }>;

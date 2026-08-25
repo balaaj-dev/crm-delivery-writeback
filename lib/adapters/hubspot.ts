@@ -24,7 +24,13 @@
  * There is nothing for this adapter to do here; do not re-add a write to
  * this property.
  */
-import type { CanonicalEvent, ClientConfig, CrmAdapter, CrmFieldDescriptor } from '../types';
+import type {
+  CanonicalEvent,
+  ClientConfig,
+  CrmAdapter,
+  CrmDealStageDescriptor,
+  CrmFieldDescriptor,
+} from '../types';
 import { logger } from '../log';
 
 const HUBSPOT_API_BASE = 'https://api.hubapi.com';
@@ -52,6 +58,27 @@ class HubspotApiError extends Error {
   ) {
     super(message);
     this.name = 'HubspotApiError';
+  }
+}
+
+/**
+ * HubSpot error bodies are JSON with a top-level `message` and sometimes a
+ * more specific `errors[].message`. Surfacing the raw body (as this used to)
+ * dumps a wall of JSON into /log and the wizard's warning banners — not
+ * something a CSM should have to read. This extracts the human-readable
+ * part; falls back to the raw text (truncated) if it isn't JSON.
+ */
+function hubspotErrorSummary(rawText: string): string {
+  try {
+    const parsed = JSON.parse(rawText) as {
+      message?: string;
+      errors?: Array<{ message?: string }>;
+    };
+    const specific = parsed.errors?.[0]?.message;
+    if (specific && parsed.message) return `${parsed.message} (${specific})`;
+    return specific ?? parsed.message ?? rawText.slice(0, 200);
+  } catch {
+    return rawText.slice(0, 200);
   }
 }
 
@@ -133,6 +160,22 @@ async function hubspotFetch(
   return res;
 }
 
+interface HubspotPipeline {
+  id: string;
+  label: string;
+  stages: Array<{ id: string; label: string }>;
+}
+
+/** Shared by listDealStages (wizard picker) and createDeal (pipeline lookup for a chosen stage). */
+async function fetchDealPipelines(cfg: ClientConfig): Promise<HubspotPipeline[]> {
+  const res = await hubspotFetch(cfg, '/crm/v3/pipelines/deals');
+  if (!res.ok) {
+    throw new HubspotApiError(res.status, `HubSpot fetchDealPipelines failed: ${hubspotErrorSummary(await res.text())}`);
+  }
+  const body = (await res.json()) as { results: HubspotPipeline[] };
+  return body.results;
+}
+
 function fieldMapValue(event: CanonicalEvent, canonicalPath: string): string | undefined {
   const parts = canonicalPath.split('.');
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -167,7 +210,7 @@ async function ensureCymateStatusProperty(cfg: ClientConfig): Promise<void> {
   if (!res.ok && res.status !== 409) {
     throw new HubspotApiError(
       res.status,
-      `HubSpot: failed to create ${CYMATE_STATUS_PROPERTY} property: ${await res.text()}`,
+      `HubSpot: failed to create ${CYMATE_STATUS_PROPERTY} property: ${hubspotErrorSummary(await res.text())}`,
     );
   }
 }
@@ -207,7 +250,7 @@ export const hubspotAdapter: CrmAdapter = {
     );
     if (res.status === 404) return null;
     if (!res.ok) {
-      throw new HubspotApiError(res.status, `HubSpot findRecord failed: ${await res.text()}`);
+      throw new HubspotApiError(res.status, `HubSpot findRecord failed: ${hubspotErrorSummary(await res.text())}`);
     }
     const body = (await res.json()) as { id: string };
     return { objectType: 'contact', id: body.id, url: `https://app.hubspot.com/contacts/${body.id}` };
@@ -226,7 +269,7 @@ export const hubspotAdapter: CrmAdapter = {
       body: JSON.stringify({ properties }),
     });
     if (!res.ok) {
-      throw new HubspotApiError(res.status, `HubSpot createRecord failed: ${await res.text()}`);
+      throw new HubspotApiError(res.status, `HubSpot createRecord failed: ${hubspotErrorSummary(await res.text())}`);
     }
     const body = (await res.json()) as { id: string };
     logger.info('hubspot: created contact', { id: body.id });
@@ -260,7 +303,7 @@ export const hubspotAdapter: CrmAdapter = {
     if (!createRes.ok) {
       throw new HubspotApiError(
         createRes.status,
-        `HubSpot writeActivity (create note) failed: ${await createRes.text()}`,
+        `HubSpot writeActivity (create note) failed: ${hubspotErrorSummary(await createRes.text())}`,
       );
     }
     const note = (await createRes.json()) as { id: string };
@@ -273,7 +316,7 @@ export const hubspotAdapter: CrmAdapter = {
     if (!assocRes.ok) {
       throw new HubspotApiError(
         assocRes.status,
-        `HubSpot writeActivity (associate note) failed: ${await assocRes.text()}`,
+        `HubSpot writeActivity (associate note) failed: ${hubspotErrorSummary(await assocRes.text())}`,
       );
     }
   },
@@ -296,30 +339,49 @@ export const hubspotAdapter: CrmAdapter = {
         await ensureCymateStatusProperty(cfg);
         res = await patch();
       } else {
-        throw new HubspotApiError(res.status, `HubSpot updateStatus failed: ${detail}`);
+        throw new HubspotApiError(res.status, `HubSpot updateStatus failed: ${hubspotErrorSummary(detail)}`);
       }
     }
     if (!res.ok) {
-      throw new HubspotApiError(res.status, `HubSpot updateStatus failed: ${await res.text()}`);
+      throw new HubspotApiError(res.status, `HubSpot updateStatus failed: ${hubspotErrorSummary(await res.text())}`);
     }
   },
 
   async createDeal(ref, _event, cfg) {
+    // HubSpot silently drops `dealstage` unless `pipeline` is sent alongside
+    // it (confirmed live, 25 Aug 2026 — no error, the value just comes back
+    // null). Resolve which pipeline the configured stage actually belongs
+    // to rather than guessing.
+    let stageProperties: Record<string, string> = {};
+    if (cfg.behaviour.dealStageOnCreate) {
+      const pipelines = await fetchDealPipelines(cfg);
+      const match = pipelines
+        .flatMap((p) => p.stages.map((s) => ({ pipelineId: p.id, stageId: s.id })))
+        .find((s) => s.stageId === cfg.behaviour.dealStageOnCreate);
+      if (match) {
+        stageProperties = { pipeline: match.pipelineId, dealstage: match.stageId };
+      } else {
+        logger.warn(
+          'hubspot: configured dealStageOnCreate not found in any pipeline — sending it alone, HubSpot will likely drop it silently',
+          { dealStageOnCreate: cfg.behaviour.dealStageOnCreate },
+        );
+        stageProperties = { dealstage: cfg.behaviour.dealStageOnCreate };
+      }
+    }
+
     const createRes = await hubspotFetch(cfg, '/crm/v3/objects/deals', {
       method: 'POST',
       body: JSON.stringify({
         properties: {
           dealname: `Cymate writeback — ${ref.id}`,
-          ...(cfg.behaviour.dealStageOnCreate
-            ? { dealstage: cfg.behaviour.dealStageOnCreate }
-            : {}),
+          ...stageProperties,
         },
       }),
     });
     if (!createRes.ok) {
       throw new HubspotApiError(
         createRes.status,
-        `HubSpot createDeal failed: ${await createRes.text()}`,
+        `HubSpot createDeal failed: ${hubspotErrorSummary(await createRes.text())}`,
       );
     }
     const deal = (await createRes.json()) as { id: string };
@@ -332,7 +394,7 @@ export const hubspotAdapter: CrmAdapter = {
     if (!assocRes.ok) {
       throw new HubspotApiError(
         assocRes.status,
-        `HubSpot createDeal (associate) failed: ${await assocRes.text()}`,
+        `HubSpot createDeal (associate) failed: ${hubspotErrorSummary(await assocRes.text())}`,
       );
     }
   },
@@ -340,7 +402,7 @@ export const hubspotAdapter: CrmAdapter = {
   async describeFields(cfg, objectType) {
     const res = await hubspotFetch(cfg, `/crm/v3/properties/${objectType}`);
     if (!res.ok) {
-      throw new HubspotApiError(res.status, `HubSpot describeFields failed: ${await res.text()}`);
+      throw new HubspotApiError(res.status, `HubSpot describeFields failed: ${hubspotErrorSummary(await res.text())}`);
     }
     const body = (await res.json()) as {
       results: Array<{
@@ -363,6 +425,24 @@ export const hubspotAdapter: CrmAdapter = {
           options: p.options?.map((o) => o.value),
         }),
       );
+  },
+
+  /**
+   * Powers the wizard's deal-stage picker. [VERIFY-once-scoped]: requires
+   * crm.objects.deals.read (or crm.schemas.deals.read) — confirmed live
+   * (25 Aug 2026) this is a separate scope from crm.objects.deals.write,
+   * which is enough to create deals but not to list pipeline stages.
+   */
+  async listDealStages(cfg): Promise<CrmDealStageDescriptor[]> {
+    const pipelines = await fetchDealPipelines(cfg);
+    return pipelines.flatMap((pipeline) =>
+      pipeline.stages.map((stage) => ({
+        id: stage.id,
+        label: stage.label,
+        pipelineLabel: pipeline.label,
+        pipelineId: pipeline.id,
+      })),
+    );
   },
 
   async testConnection(cfg) {

@@ -8,6 +8,7 @@ import {
   DEFAULT_FIELD_MAP,
   type ClientConfig,
   type CrmType,
+  type CrmDealStageDescriptor,
   type CrmFieldDescriptor,
   type FieldMapping,
   type WritebackMode,
@@ -16,6 +17,7 @@ import {
 const STEP_TITLES = [
   'Select client',
   'Auto-populated summary',
+  'Select campaigns',
   'Writeback mode',
   'Select CRM',
   'CRM branch',
@@ -114,6 +116,10 @@ export default function SetupWizard() {
   const [loadError, setLoadError] = useState<string | null>(null);
   const [selectedClientId, setSelectedClientId] = useState<string>('');
 
+  const [campaigns, setCampaigns] = useState<{ id: string; name: string; status: string }[]>([]);
+  const [campaignsWarning, setCampaignsWarning] = useState<string | null>(null);
+  const [selectedCampaignIds, setSelectedCampaignIds] = useState<string[]>([]);
+
   const [mode, setMode] = useState<WritebackMode>('partial');
   const [crmType, setCrmType] = useState<CrmType>('hubspot');
   const [credentials, setCredentials] = useState<Record<string, string>>({});
@@ -131,6 +137,8 @@ export default function SetupWizard() {
   const [createRecordForAllLeads, setCreateRecordForAllLeads] = useState(false);
   const [createDeal, setCreateDeal] = useState(false);
   const [dealStageOnCreate, setDealStageOnCreate] = useState('');
+  const [dealStages, setDealStages] = useState<CrmDealStageDescriptor[]>([]);
+  const [dealStagesWarning, setDealStagesWarning] = useState<string | null>(null);
   const [planLimitAcknowledged, setPlanLimitAcknowledged] = useState(false);
 
   const [building, setBuilding] = useState(false);
@@ -156,6 +164,13 @@ export default function SetupWizard() {
     const preset = MODE_PRESETS[next];
     setCreateRecordOnInterestedReply(preset.behaviour.createRecordOnInterestedReply ?? true);
     setCreateRecordForAllLeads(preset.behaviour.createRecordForAllLeads ?? false);
+  }
+
+  async function loadCampaigns() {
+    const res = await fetch(`/api/smartlead/campaigns?clientId=${encodeURIComponent(selectedClientId)}`);
+    const data = await res.json();
+    setCampaigns(data.campaigns ?? []);
+    setCampaignsWarning(data.warning ?? null);
   }
 
   async function runTestConnection() {
@@ -189,6 +204,15 @@ export default function SetupWizard() {
     setStatusMap(data.defaultSuggestions ?? {});
   }
 
+  async function loadDealStages() {
+    const res = await fetch(
+      `/api/crm/${crmType}/deal-stages?clientId=${encodeURIComponent(selectedClientId)}`,
+    );
+    const data = await res.json();
+    setDealStages(data.stages ?? []);
+    setDealStagesWarning(data.warning ?? null);
+  }
+
   async function runBuild() {
     setBuilding(true);
     setBuildResult(null);
@@ -198,7 +222,10 @@ export default function SetupWizard() {
         clientName: selectedClient?.clientName ?? selectedClientId,
         activated: true,
         mode,
-        source: selectedClient?.source ?? { platform: 'smartlead', apiKey: '' },
+        source: {
+          ...(selectedClient?.source ?? { platform: 'smartlead', apiKey: '' }),
+          campaignIds: selectedCampaignIds,
+        },
         crm: {
           type: crmType,
           integrationPath: crmType === 'salesforce' ? 'outboundsync' : 'native',
@@ -217,11 +244,16 @@ export default function SetupWizard() {
         notifications: selectedClient?.notifications ?? {},
       };
 
-      await fetch(`/api/clients/${selectedClientId}/config`, {
+      // Awaited (not fire-and-forget) — this must complete before the test
+      // event fires below, since it's what makes the test event (and any
+      // real webhook after it) actually see what was just configured
+      // instead of stale fixture/Airtable data. See lib/config.ts.
+      const putRes = await fetch(`/api/clients/${selectedClientId}/config`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(finalConfig),
-      }).catch(() => null); // fixtures mode logs-only; failures here are non-fatal for the demo
+      });
+      const putData = await putRes.json();
 
       const registerRes = await fetch('/api/webhooks/register', {
         method: 'POST',
@@ -237,7 +269,13 @@ export default function SetupWizard() {
       });
       const testEventData = await testEventRes.json();
 
-      setBuildResult({ config: finalConfig, registration: registerData, testEvent: testEventData });
+      setBuildResult({
+        config: finalConfig,
+        persisted: putData.persisted,
+        persistWarning: putData.persistWarning,
+        registration: registerData,
+        testEvent: testEventData,
+      });
     } finally {
       setBuilding(false);
     }
@@ -258,7 +296,7 @@ export default function SetupWizard() {
           <a href="/log" className="font-medium text-cymate-navy underline decoration-cymate-cyan decoration-2 underline-offset-2">
             event log
           </a>{' '}
-          after step 10.
+          after the last step.
         </p>
       </div>
 
@@ -311,11 +349,63 @@ export default function SetupWizard() {
                 </div>
               ))}
             </dl>
-            <NavButtons onBack={() => setStep(1)} onNext={() => setStep(3)} />
+            <NavButtons
+              onBack={() => setStep(1)}
+              onNext={() => {
+                loadCampaigns();
+                setStep(3);
+              }}
+            />
           </section>
         )}
 
         {step === 3 && (
+          <section>
+            {campaignsWarning && (
+              <p className="mb-4 rounded-lg bg-amber-50 p-3 text-sm text-amber-800 ring-1 ring-inset ring-amber-200">
+                {campaignsWarning}
+              </p>
+            )}
+            <p className="mb-4 text-sm text-slate-600">
+              Choose which Smartlead campaigns this client&apos;s writeback covers. Webhooks are only
+              registered for campaigns selected here — pick nothing and nothing will sync.
+            </p>
+            {campaigns.length === 0 ? (
+              <p className="rounded-lg border border-dashed border-slate-300 p-4 text-sm text-slate-500">
+                No campaigns found for this client&apos;s Smartlead account yet.
+              </p>
+            ) : (
+              <div className="space-y-2">
+                {campaigns.map((c) => (
+                  <label
+                    key={c.id}
+                    className="flex items-center gap-2.5 rounded-lg border border-slate-200 px-3 py-2 text-sm"
+                  >
+                    <input
+                      type="checkbox"
+                      className="h-4 w-4 accent-cymate-orange"
+                      checked={selectedCampaignIds.includes(c.id)}
+                      onChange={(e) =>
+                        setSelectedCampaignIds((prev) =>
+                          e.target.checked ? [...prev, c.id] : prev.filter((id) => id !== c.id),
+                        )
+                      }
+                    />
+                    <span className="flex-1 text-cymate-navy">{c.name}</span>
+                    <span className="text-xs uppercase text-slate-400">{c.status}</span>
+                  </label>
+                ))}
+              </div>
+            )}
+            <NavButtons
+              onBack={() => setStep(2)}
+              onNext={() => setStep(4)}
+              nextDisabled={campaigns.length > 0 && selectedCampaignIds.length === 0}
+            />
+          </section>
+        )}
+
+        {step === 4 && (
           <section className="space-y-3">
             {(['partial', 'full'] as WritebackMode[]).map((m) => (
               <label
@@ -343,11 +433,11 @@ export default function SetupWizard() {
                 </p>
               </label>
             ))}
-            <NavButtons onBack={() => setStep(2)} onNext={() => setStep(4)} />
+            <NavButtons onBack={() => setStep(3)} onNext={() => setStep(5)} />
           </section>
         )}
 
-        {step === 4 && (
+        {step === 5 && (
           <section>
             <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
               {CRM_TYPES.map((type) => {
@@ -381,11 +471,11 @@ export default function SetupWizard() {
                 );
               })}
             </div>
-            <NavButtons onBack={() => setStep(3)} onNext={() => setStep(5)} />
+            <NavButtons onBack={() => setStep(4)} onNext={() => setStep(6)} />
           </section>
         )}
 
-        {step === 5 && (
+        {step === 6 && (
           <section>
             {isSalesforce ? (
               <div className="rounded-xl border border-cymate-orange/30 bg-cymate-orange/5 p-4 text-sm text-cymate-navy">
@@ -409,14 +499,14 @@ export default function SetupWizard() {
                 working adapter in this skeleton. Continue to enter credentials.
               </p>
             )}
-            <NavButtons onBack={() => setStep(4)} onNext={() => setStep(6)} nextDisabled={isSalesforce} />
+            <NavButtons onBack={() => setStep(5)} onNext={() => setStep(7)} nextDisabled={isSalesforce} />
           </section>
         )}
 
-        {step === 6 && (
+        {step === 7 && (
           <section>
             <label className="block text-sm font-medium text-slate-700">
-              {crmType === 'hubspot' ? 'HubSpot Private App access token' : 'Access token / API key'}
+              {crmType === 'hubspot' ? 'HubSpot Service Key access token' : 'Access token / API key'}
             </label>
             <input
               type="password"
@@ -444,17 +534,17 @@ export default function SetupWizard() {
               </p>
             )}
             <NavButtons
-              onBack={() => setStep(5)}
+              onBack={() => setStep(6)}
               onNext={() => {
                 loadFields();
-                setStep(7);
+                setStep(8);
               }}
               nextDisabled={!testResult?.ok}
             />
           </section>
         )}
 
-        {step === 7 && (
+        {step === 8 && (
           <section>
             <p className="mb-4 text-sm text-slate-600">
               Canonical field on the left, real {crmType} field on the right. Pre-filled with sane
@@ -486,16 +576,16 @@ export default function SetupWizard() {
               ))}
             </div>
             <NavButtons
-              onBack={() => setStep(6)}
+              onBack={() => setStep(7)}
               onNext={() => {
                 loadCategories();
-                setStep(8);
+                setStep(9);
               }}
             />
           </section>
         )}
 
-        {step === 8 && (
+        {step === 9 && (
           <section>
             {categoriesWarning && (
               <p className="mb-4 rounded-lg bg-amber-50 p-3 text-sm text-amber-800 ring-1 ring-inset ring-amber-200">
@@ -532,11 +622,11 @@ export default function SetupWizard() {
                   </div>
                 ))}
             </div>
-            <NavButtons onBack={() => setStep(7)} onNext={() => setStep(9)} />
+            <NavButtons onBack={() => setStep(8)} onNext={() => setStep(10)} />
           </section>
         )}
 
-        {step === 9 && (
+        {step === 10 && (
           <section className="space-y-4 text-sm">
             <label className="flex items-center gap-2.5">
               <input
@@ -562,17 +652,48 @@ export default function SetupWizard() {
                 type="checkbox"
                 className="h-4 w-4 accent-cymate-orange"
                 checked={createDeal}
-                onChange={(e) => setCreateDeal(e.target.checked)}
+                onChange={(e) => {
+                  setCreateDeal(e.target.checked);
+                  if (e.target.checked && dealStages.length === 0 && !dealStagesWarning) {
+                    loadDealStages();
+                  }
+                }}
               />
               Create a deal on positive reply / meeting booked
             </label>
             {createDeal && (
-              <input
-                className={inputClass}
-                placeholder="Deal stage on create (optional)"
-                value={dealStageOnCreate}
-                onChange={(e) => setDealStageOnCreate(e.target.value)}
-              />
+              <div>
+                <label className="mb-1 block text-xs font-medium text-slate-500">
+                  Deal stage on create
+                </label>
+                {dealStagesWarning && (
+                  <p className="mb-2 rounded-lg bg-amber-50 p-3 text-sm text-amber-800 ring-1 ring-inset ring-amber-200">
+                    Couldn&apos;t fetch real stages from {crmType} ({dealStagesWarning}). Enter the
+                    stage ID manually, or leave blank to use the pipeline&apos;s default stage.
+                  </p>
+                )}
+                {dealStages.length > 0 ? (
+                  <select
+                    className={inputClass}
+                    value={dealStageOnCreate}
+                    onChange={(e) => setDealStageOnCreate(e.target.value)}
+                  >
+                    <option value="">Use the pipeline&apos;s default stage</option>
+                    {dealStages.map((s) => (
+                      <option key={s.id} value={s.id}>
+                        {s.pipelineLabel} — {s.label}
+                      </option>
+                    ))}
+                  </select>
+                ) : (
+                  <input
+                    className={inputClass}
+                    placeholder="Deal stage ID (optional — leave blank for the pipeline default)"
+                    value={dealStageOnCreate}
+                    onChange={(e) => setDealStageOnCreate(e.target.value)}
+                  />
+                )}
+              </div>
             )}
             {mode === 'full' && (
               <label className="flex items-start gap-2.5 rounded-xl border border-cymate-orange/30 bg-cymate-orange/5 p-3">
@@ -590,19 +711,23 @@ export default function SetupWizard() {
               </label>
             )}
             <NavButtons
-              onBack={() => setStep(8)}
-              onNext={() => setStep(10)}
+              onBack={() => setStep(9)}
+              onNext={() => setStep(11)}
               nextDisabled={mode === 'full' && !planLimitAcknowledged}
             />
           </section>
         )}
 
-        {step === 10 && (
+        {step === 11 && (
           <section>
             <dl className="grid grid-cols-2 gap-3 rounded-lg border border-slate-100 bg-slate-50/60 p-4 text-sm sm:grid-cols-3">
               <div>
                 <dt className="text-xs font-medium uppercase tracking-wide text-slate-400">Client</dt>
                 <dd className="mt-0.5 font-medium text-cymate-navy">{selectedClient?.clientName}</dd>
+              </div>
+              <div>
+                <dt className="text-xs font-medium uppercase tracking-wide text-slate-400">Campaigns</dt>
+                <dd className="mt-0.5 font-medium text-cymate-navy">{selectedCampaignIds.length}</dd>
               </div>
               <div>
                 <dt className="text-xs font-medium uppercase tracking-wide text-slate-400">Mode</dt>
@@ -621,6 +746,13 @@ export default function SetupWizard() {
                 <dd className="mt-0.5 font-medium text-cymate-navy">{Object.keys(statusMap).length}</dd>
               </div>
             </dl>
+
+            {selectedCampaignIds.length === 0 && (
+              <p className="mt-4 rounded-lg bg-amber-50 p-3 text-sm text-amber-800 ring-1 ring-inset ring-amber-200">
+                No campaigns selected — webhook registration will fail until at least one is chosen
+                back in step 3.
+              </p>
+            )}
 
             <button
               onClick={runBuild}
@@ -646,7 +778,7 @@ export default function SetupWizard() {
               </a>{' '}
               to confirm the test event landed correctly.
             </p>
-            <NavButtons onBack={() => setStep(9)} onNext={() => {}} nextDisabled />
+            <NavButtons onBack={() => setStep(10)} onNext={() => {}} nextDisabled />
           </section>
         )}
       </div>
