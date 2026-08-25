@@ -13,6 +13,7 @@ import type {
   CanonicalEventType,
   ClientConfig,
   CrmAdapter,
+  CrmRecordRef,
   DispatchOutcome,
 } from './types';
 import { hasBeenProcessed, markProcessed } from './idempotency';
@@ -97,10 +98,17 @@ export async function dispatchEvent(
   }
   markProcessed(event.eventId);
 
+  // Declared outside the try block so the catch below can report whatever
+  // succeeded before a later step failed, instead of losing it — see the
+  // "Live HubSpot test" note in docs/HANDOVER.md for the real case that
+  // motivated this (deal creation failing on a missing scope after the
+  // contact was already created and the note already written).
+  let ref: CrmRecordRef | null = null;
+  const actions: string[] = [];
+
   try {
     // 5. find existing record
-    let ref = await adapter.findRecord(event.prospect.email, cfg);
-    const actions: string[] = [];
+    ref = await adapter.findRecord(event.prospect.email, cfg);
 
     if (!ref) {
       // 6. may we create?
@@ -148,7 +156,7 @@ export async function dispatchEvent(
     return { status: 'success', ref, actions };
   } catch (err) {
     const reason = err instanceof Error ? err.message : String(err);
-    await recordEvent({ ...baseLog, outcome: 'error', reason });
-    return { status: 'error', reason };
+    await recordEvent({ ...baseLog, outcome: 'error', reason, detail: { ref, actions } });
+    return { status: 'error', reason, actions, ref: ref ?? undefined };
   }
 }

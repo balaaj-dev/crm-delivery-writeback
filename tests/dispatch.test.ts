@@ -185,6 +185,40 @@ describe('dispatchEvent — error handling', () => {
     expect(outcome.status).toBe('error');
     if (outcome.status === 'error') expect(outcome.reason).toContain('boom');
   });
+
+  it('preserves actions and ref that succeeded before a later step failed', async () => {
+    // Regression test for a real bug found testing against live HubSpot:
+    // deal creation failed on a missing scope *after* the contact was
+    // already created and the note already written — the error outcome
+    // must not lose that.
+    const cfg = baseConfig({
+      behaviour: {
+        createRecordOnInterestedReply: true,
+        createRecordForAllLeads: false,
+        createDeal: true,
+        planLimitAcknowledged: false,
+      },
+    });
+    const partiallyFailingAdapter = {
+      ...mockAdapter,
+      createDeal: async () => {
+        throw new Error('MISSING_SCOPES: crm.objects.deals.write');
+      },
+    };
+    const outcome = await dispatchEvent(
+      baseEvent({ type: 'positive_reply', prospect: { email: 'partial-failure@example.com' } }),
+      cfg,
+      partiallyFailingAdapter,
+    );
+    expect(outcome.status).toBe('error');
+    if (outcome.status === 'error') {
+      expect(outcome.reason).toContain('MISSING_SCOPES');
+      expect(outcome.actions).toContain('created_record');
+      expect(outcome.actions).toContain('wrote_activity');
+      expect(outcome.actions).not.toContain('created_deal');
+      expect(outcome.ref).toBeDefined();
+    }
+  });
 });
 
 describe('resolveEffectiveEventType', () => {

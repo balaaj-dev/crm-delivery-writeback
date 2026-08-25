@@ -63,8 +63,14 @@ export default async function LogPage() {
                     <td className="px-4 py-3">
                       <OutcomeBadge outcome={entry.outcome} />
                     </td>
-                    <td className="max-w-xs truncate px-4 py-3 font-mono text-xs text-slate-500">
-                      {entry.reason ?? (entry.detail ? JSON.stringify(entry.detail) : '—')}
+                    <td
+                      className="max-w-xs truncate px-4 py-3 font-mono text-xs text-slate-500"
+                      title={[entry.reason, entry.detail ? JSON.stringify(entry.detail) : null]
+                        .filter(Boolean)
+                        .join(' — ')}
+                    >
+                      {entry.reason ?? '—'}
+                      {entry.detail ? ` — ${JSON.stringify(entry.detail)}` : ''}
                     </td>
                     <td className="px-4 py-3">
                       <span

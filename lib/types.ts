@@ -303,4 +303,7 @@ export type SkipReason =
 export type DispatchOutcome =
   | { status: 'success'; ref: CrmRecordRef; actions: string[] }
   | { status: 'skip'; reason: SkipReason }
-  | { status: 'error'; reason: string };
+  // actions/ref capture whatever succeeded before the failing step, so a
+  // partial failure (e.g. contact created + note written, then deal
+  // creation fails on a missing scope) doesn't read as a total loss.
+  | { status: 'error'; reason: string; actions: string[]; ref?: CrmRecordRef };
