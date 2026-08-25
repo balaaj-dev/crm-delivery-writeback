@@ -23,6 +23,7 @@ const STEP_TITLES = [
   'CRM branch',
   'CRM credentials',
   'Field mapping',
+  'Deliver contacts',
   'Status mapping',
   'Record behaviour + plan check',
   'Review and build',
@@ -141,6 +142,23 @@ export default function SetupWizard() {
   const [dealStagesWarning, setDealStagesWarning] = useState<string | null>(null);
   const [planLimitAcknowledged, setPlanLimitAcknowledged] = useState(false);
 
+  const [deliveryMaxLeads, setDeliveryMaxLeads] = useState(25);
+  const [deliveryResults, setDeliveryResults] = useState<
+    Array<{
+      campaignId: string;
+      error?: string;
+      result?: {
+        totalLeadsInCampaign: number;
+        processed: number;
+        created: number;
+        alreadyExisted: number;
+        errors: Array<{ email: string; reason: string }>;
+        cappedAt?: number;
+      };
+    }>
+  >([]);
+  const [delivering, setDelivering] = useState(false);
+
   const [building, setBuilding] = useState(false);
   const [buildResult, setBuildResult] = useState<unknown>(null);
 
@@ -211,6 +229,26 @@ export default function SetupWizard() {
     const data = await res.json();
     setDealStages(data.stages ?? []);
     setDealStagesWarning(data.warning ?? null);
+  }
+
+  async function runDelivery() {
+    setDelivering(true);
+    setDeliveryResults([]);
+    try {
+      const results = [];
+      for (const campaignId of selectedCampaignIds) {
+        const res = await fetch('/api/delivery/run', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ clientId: selectedClientId, campaignId, maxLeads: deliveryMaxLeads }),
+        });
+        const data = await res.json();
+        results.push({ campaignId, result: data.result, error: data.error });
+      }
+      setDeliveryResults(results);
+    } finally {
+      setDelivering(false);
+    }
   }
 
   async function runBuild() {
@@ -575,17 +613,93 @@ export default function SetupWizard() {
                 </div>
               ))}
             </div>
+            <NavButtons onBack={() => setStep(7)} onNext={() => setStep(9)} />
+          </section>
+        )}
+
+        {step === 9 && (
+          <section>
+            <p className="mb-4 text-sm text-slate-600">
+              The other half of S1 — bulk-create CRM records for leads that already exist in the
+              campaigns selected in step 3, independent of any reply or activity. Separate from
+              writeback, which only reacts to new events going forward.
+            </p>
+            {selectedCampaignIds.length === 0 ? (
+              <p className="rounded-lg border border-dashed border-slate-300 p-4 text-sm text-slate-500">
+                No campaigns were selected in step 3 — go back and select at least one to deliver
+                leads from.
+              </p>
+            ) : (
+              <>
+                <label className="block text-sm font-medium text-slate-700">
+                  Max leads per campaign (safety cap)
+                </label>
+                <input
+                  type="number"
+                  min={1}
+                  max={1000}
+                  className={`mt-2 w-40 ${inputClass}`}
+                  value={deliveryMaxLeads}
+                  onChange={(e) => setDeliveryMaxLeads(Math.max(1, Number(e.target.value) || 1))}
+                />
+                <p className="mt-1 text-xs text-slate-500">
+                  Delivering a whole large campaign at once needs a real background job runner,
+                  not built in this skeleton — this cap keeps a single request bounded.
+                </p>
+                <button
+                  onClick={runDelivery}
+                  disabled={delivering}
+                  className="mt-4 rounded-lg bg-cymate-orange px-4 py-2 text-sm font-semibold text-white shadow-sm transition hover:bg-cymate-orange-dark disabled:opacity-50"
+                >
+                  {delivering
+                    ? 'Delivering…'
+                    : `Deliver leads from ${selectedCampaignIds.length} campaign${selectedCampaignIds.length === 1 ? '' : 's'}`}
+                </button>
+
+                {deliveryResults.length > 0 && (
+                  <div className="mt-4 space-y-2">
+                    {deliveryResults.map((r) => (
+                      <div key={r.campaignId} className="rounded-lg border border-slate-200 p-3 text-sm">
+                        <p className="font-medium text-cymate-navy">Campaign {r.campaignId}</p>
+                        {r.error ? (
+                          <p className="mt-1 text-rose-700">{r.error}</p>
+                        ) : r.result ? (
+                          <div className="mt-1 text-slate-600">
+                            <p>
+                              {r.result.created} created · {r.result.alreadyExisted} already existed ·{' '}
+                              {r.result.errors.length} errors
+                              {r.result.cappedAt
+                                ? ` · capped at ${r.result.cappedAt} of ${r.result.totalLeadsInCampaign} total leads`
+                                : ''}
+                            </p>
+                            {r.result.errors.length > 0 && (
+                              <ul className="mt-1 list-inside list-disc text-xs text-rose-700">
+                                {r.result.errors.map((e) => (
+                                  <li key={e.email}>
+                                    {e.email}: {e.reason}
+                                  </li>
+                                ))}
+                              </ul>
+                            )}
+                          </div>
+                        ) : null}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </>
+            )}
             <NavButtons
-              onBack={() => setStep(7)}
+              onBack={() => setStep(8)}
               onNext={() => {
                 loadCategories();
-                setStep(9);
+                setStep(10);
               }}
             />
           </section>
         )}
 
-        {step === 9 && (
+        {step === 10 && (
           <section>
             {categoriesWarning && (
               <p className="mb-4 rounded-lg bg-amber-50 p-3 text-sm text-amber-800 ring-1 ring-inset ring-amber-200">
@@ -622,11 +736,11 @@ export default function SetupWizard() {
                   </div>
                 ))}
             </div>
-            <NavButtons onBack={() => setStep(8)} onNext={() => setStep(10)} />
+            <NavButtons onBack={() => setStep(9)} onNext={() => setStep(11)} />
           </section>
         )}
 
-        {step === 10 && (
+        {step === 11 && (
           <section className="space-y-4 text-sm">
             <label className="flex items-center gap-2.5">
               <input
@@ -711,14 +825,14 @@ export default function SetupWizard() {
               </label>
             )}
             <NavButtons
-              onBack={() => setStep(9)}
-              onNext={() => setStep(11)}
+              onBack={() => setStep(10)}
+              onNext={() => setStep(12)}
               nextDisabled={mode === 'full' && !planLimitAcknowledged}
             />
           </section>
         )}
 
-        {step === 11 && (
+        {step === 12 && (
           <section>
             <dl className="grid grid-cols-2 gap-3 rounded-lg border border-slate-100 bg-slate-50/60 p-4 text-sm sm:grid-cols-3">
               <div>
@@ -778,7 +892,7 @@ export default function SetupWizard() {
               </a>{' '}
               to confirm the test event landed correctly.
             </p>
-            <NavButtons onBack={() => setStep(10)} onNext={() => {}} nextDisabled />
+            <NavButtons onBack={() => setStep(11)} onNext={() => {}} nextDisabled />
           </section>
         )}
       </div>

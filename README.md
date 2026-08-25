@@ -7,8 +7,14 @@ client. See `docs/HANDOVER.md` for exactly what production work remains.
 
 ## What this is
 
-Smartlead campaign activity (sends, replies, bounces, unsubscribes, category/status changes)
-flows into a client's CRM as contacts, activity notes, status updates, and (optionally) deals.
+Two halves of Cymate's S1 service:
+
+- **Delivery** (`lib/delivery.ts`, wizard step 9) — bulk-creates CRM contacts from a client's
+  existing Smartlead leads, capped per run.
+- **Writeback** (`lib/dispatch.ts` + the webhook path) — ongoing campaign activity (sends,
+  replies, bounces, unsubscribes, category/status changes) flows into a client's CRM as contacts,
+  activity notes, status updates, and (optionally) deals, as it happens.
+
 Per-client behaviour — which CRM, which fields map where, partial vs. full writeback, whether to
 create records/deals — is all `ClientConfig`, sourced from Airtable (or `fixtures/clients.json`
 for this skeleton).

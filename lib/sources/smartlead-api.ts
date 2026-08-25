@@ -11,6 +11,11 @@
  *   CONFIRMED    Auth is an `api_key` query parameter, not a bearer token.
  *   CONFIRMED    GET /campaigns/ lists a workspace's campaigns (used for the
  *                wizard's campaign-selection step).
+ *   CONFIRMED    GET /campaigns/{id}/leads lists a campaign's leads, paginated
+ *                via offset/limit, response shape { total_leads, data, offset,
+ *                limit } — used for delivery (lib/delivery.ts). Verified live
+ *                against a real account's real campaigns (25 Aug 2026),
+ *                read-only, no campaign data modified.
  *   NOT CONFIRMED  The exact path for listing lead categories.
  *   NOT CONFIRMED  The exact path/payload shape for webhook registration.
  *
@@ -53,6 +58,66 @@ export async function listCampaigns(apiKey: string): Promise<SmartleadCampaign[]
   }
   const body = (await res.json()) as Array<{ id: number | string; name: string; status: string }>;
   return body.map((c) => ({ id: String(c.id), name: c.name, status: c.status }));
+}
+
+export interface SmartleadLead {
+  email: string;
+  firstName?: string;
+  lastName?: string;
+  company?: string;
+  title?: string;
+  phone?: string;
+  linkedinUrl?: string;
+}
+
+/**
+ * Confirmed live (25 Aug 2026) against a real Smartlead account's real
+ * campaigns — read-only, does not modify anything about the campaign.
+ * Pages through `data` using offset/limit until `limit` leads have been
+ * collected or the campaign is exhausted, whichever comes first — callers
+ * needing "the whole campaign" for a huge list should raise `limit`
+ * deliberately, not assume this fetches everything by default.
+ */
+export async function listCampaignLeads(
+  apiKey: string,
+  campaignId: string,
+  limit = 100,
+): Promise<{ leads: SmartleadLead[]; totalLeads: number }> {
+  const url = new URL(`${SMARTLEAD_API_BASE}/campaigns/${campaignId}/leads`);
+  url.searchParams.set('api_key', apiKey);
+  url.searchParams.set('offset', '0');
+  url.searchParams.set('limit', String(limit));
+
+  const res = await fetch(url);
+  if (!res.ok) {
+    throw new Error(`Smartlead list-campaign-leads call failed (${res.status}): ${await res.text()}`);
+  }
+  const body = (await res.json()) as {
+    total_leads: string;
+    data: Array<{
+      lead: {
+        email: string;
+        first_name?: string;
+        last_name?: string;
+        company_name?: string;
+        phone_number?: string | null;
+        linkedin_profile?: string | null;
+        custom_fields?: Record<string, string>;
+      };
+    }>;
+  };
+  return {
+    totalLeads: Number(body.total_leads),
+    leads: body.data.map((entry) => ({
+      email: entry.lead.email,
+      firstName: entry.lead.first_name,
+      lastName: entry.lead.last_name,
+      company: entry.lead.company_name,
+      title: entry.lead.custom_fields?.Title,
+      phone: entry.lead.phone_number ?? undefined,
+      linkedinUrl: entry.lead.linkedin_profile ?? undefined,
+    })),
+  };
 }
 
 /**

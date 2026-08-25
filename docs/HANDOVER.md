@@ -12,6 +12,32 @@ a `ClientConfig` object), not as forked code or a hand-built Make.com scenario p
 a CRM means one new file + one registry line (`docs/ADDING-A-CRM.md`). Adding a client means
 filling in Airtable fields, not writing code.
 
+## Delivery — the other half of S1 (added after the original brief)
+
+The build brief this repo was originally built from scoped it to writeback only (Jairo's own
+framing on the 19 Aug call: *"there's essentially two parts to it... taking our data and having
+that uploaded to the CRM... and then the second part is writeback"*). Delivery — bulk-creating
+CRM contacts from a client's existing Smartlead leads, independent of any triggering event — was
+added afterward at Balaaj's request, once writeback was proven against a real HubSpot portal.
+
+- `lib/delivery.ts` — the core logic. Reuses `CrmAdapter.findRecord`/`createRecord` unchanged by
+  representing a delivered lead as a minimal `CanonicalEvent`-shaped object, rather than inventing
+  a parallel contact-creation path.
+- `lib/sources/smartlead-api.ts`'s `listCampaignLeads` — confirmed live against a real account's
+  real campaigns (`GET /campaigns/{id}/leads`), read-only.
+- `POST /api/delivery/run`, wizard step 9 ("Deliver contacts").
+- **Deliberately capped** (`maxLeads`, default 25) and synchronous — same "no durable job queue"
+  decision as the rest of this repo (brief §3). A campaign with thousands of leads needs a real
+  background job runner to deliver in full; this proves the mechanism works, it is not that job
+  runner. Never silently drops leads past the cap — `cappedAt` is always reported.
+- **Verified live** (25 Aug 2026) against Lotus Labs' real Smartlead account (read-only lead
+  fetching, their campaigns untouched) delivering into the HubSpot test portal — never their real
+  CRM. Confirmed: correct field mapping from real lead data, correct dedup on a second run
+  (already-created leads skipped, not duplicated), and results correctly show up in `/log`.
+- **Still not built**: suppression list sync (a distinct, separate S1 delivery feature, still out
+  of scope — see below) and anything resembling a real bulk-import job (progress tracking across
+  requests, resuming a partial import, syncing more than one `maxLeads` batch automatically).
+
 ## Explicitly out of scope (brief §3 / §17) — do not build these here
 
 - Akaiza integration — a separate team owns that platform; this repo must not reference it.
