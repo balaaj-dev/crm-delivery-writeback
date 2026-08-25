@@ -77,7 +77,6 @@
       "createRecordOnInterestedReply": true,
       "createRecordForAllLeads": true,
       "createDeal": true,
-      "dealStageOnCreate": "appointmentscheduled",
       "planLimitAcknowledged": true
     },
     "events": {

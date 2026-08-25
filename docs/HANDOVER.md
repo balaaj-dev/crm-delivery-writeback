@@ -104,22 +104,35 @@ actual objects from HubSpot's API afterward, not just by reading a 200 response:
   `MISSING_SCOPES` (`crm.objects.deals.write` specifically) on a Service Key that only had the
   contacts/schemas scopes. Anyone setting up a client's Service Key needs this scope *only if*
   `behaviour.createDeal` will be turned on for them — otherwise skip it, per least-privilege.
+- **HubSpot deal pipeline stage IDs are portal-specific, not universal strings.** The fixture
+  originally set `dealStageOnCreate: "appointmentscheduled"` — a real stage ID from HubSpot's
+  classic default pipeline — but this test portal's default pipeline uses raw numeric stage IDs
+  instead (confirmed live via the resulting `INVALID_OPTION` error, which usefully lists the
+  portal's actual valid IDs). Fixed by removing the hardcoded value from
+  `fixtures/clients.json` — omitting `dealStageOnCreate` lets HubSpot fall back to the pipeline's
+  own default stage, which is the more portable choice for a general-purpose fixture. **For any
+  real client**, whoever fills in "Deal Stage On Create" in the wizard needs that client's actual
+  stage ID from their HubSpot pipeline, not a guessed name — the wizard doesn't currently fetch
+  and offer real pipeline stages as options (gap; would be a good addition alongside the field-
+  mapping step, which already does this pattern for contact properties).
 - **Confirmed working end-to-end, real objects verified via GET afterward:** `findRecord` (real
   404 → not-found), `createRecord` (contact created with correct field-mapped properties),
   `writeActivity` (note created **and** correctly associated to the contact via the v4 default
-  association endpoint), `updateStatus` (after the self-heal above).
-- **New gap found via this test, not yet fixed:** when a later step in `dispatch.ts`'s sequence
-  throws (e.g. `createDeal` failing on missing scopes) *after* earlier steps in the same dispatch
-  call already succeeded (contact created, note written, status updated), the whole event is
-  logged with `outcome: 'error'` and **the successful actions are not recorded anywhere** — the
-  `DispatchOutcome` error variant has no `actions` field, unlike the success variant. `/log` will
-  show "error" for an event that mostly worked, which is misleading for exactly the kind of
-  visibility this app exists to provide (brief §8: "no\_record\_no\_create\_policy in particular
-  will be common... must be visible, not hidden" — the same principle applies to partial success).
-  Also: `markProcessed(event.eventId)` runs before the try block, so a retry of the *same* event
-  after a partial failure is skipped as a duplicate rather than retried — the deal, in this
-  example, never gets created on retry. Worth fixing: include `actions` on the error outcome, and
-  reconsider whether partial failures should still count as "processed" for idempotency purposes.
+  association endpoint), `updateStatus` (after the self-heal above), `createDeal` (deal created
+  and correctly associated to the contact via the v4 default association endpoint, once the
+  `crm.objects.deals.write` scope and a valid stage were in place).
+- **Fixed:** the partial-success-lost-on-error gap this test session found (a later step like
+  `createDeal` failing after earlier steps already succeeded used to make the whole event log as
+  a bare `error` with no record of what actually worked). `DispatchOutcome`'s error variant now
+  carries `actions`/`ref` — see `lib/dispatch.ts` and the regression test in
+  `tests/dispatch.test.ts`. Re-verified live: the same real failure now correctly shows
+  `actions: ["wrote_activity", "updated_status:meeting_booked"]` in `/log` instead of nothing.
+  **Still open:** `markProcessed(event.eventId)` runs before the try block, so a retry of the
+  *same* event after a partial failure is still skipped as a duplicate rather than retried — a
+  failed `createDeal` won't get a second attempt just because the webhook fires again. Fixing that
+  would mean deciding whether partial failures should count as "processed" at all, which trades
+  off against the concurrent-duplicate-delivery protection idempotency exists for in the first
+  place — a real design decision, not a one-line fix.
 
 ## Unresolved [VERIFY] items — confirm against live vendor docs/accounts before DRY_RUN=false
 
