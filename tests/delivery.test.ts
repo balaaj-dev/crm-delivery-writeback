@@ -5,9 +5,10 @@ import type { ClientConfig } from '@/lib/types';
 
 vi.mock('@/lib/sources/smartlead-api', () => ({
   listCampaignLeads: vi.fn(),
+  listLeadMessageHistory: vi.fn(),
 }));
 
-import { listCampaignLeads } from '@/lib/sources/smartlead-api';
+import { listCampaignLeads, listLeadMessageHistory } from '@/lib/sources/smartlead-api';
 
 const cfg: ClientConfig = {
   clientId: 'rec_test',
@@ -39,13 +40,17 @@ const cfg: ClientConfig = {
 beforeEach(() => {
   resetMockAdapterState();
   vi.mocked(listCampaignLeads).mockReset();
+  vi.mocked(listLeadMessageHistory).mockReset();
+  // Default: no history, so tests that don't care about activity backfill
+  // don't need to stub it explicitly every time.
+  vi.mocked(listLeadMessageHistory).mockResolvedValue([]);
 });
 
 describe('deliverCampaignLeads', () => {
   it('creates a record for a new lead and reports it as created', async () => {
     vi.mocked(listCampaignLeads).mockResolvedValue({
       totalLeads: 1,
-      leads: [{ email: 'brand-new-lead@example.com', firstName: 'Brand', lastName: 'New' }],
+      leads: [{ id: 'sl_1', email: 'brand-new-lead@example.com', firstName: 'Brand', lastName: 'New' }],
     });
 
     const result = await deliverCampaignLeads(cfg, mockAdapter, 'camp_1', 25);
@@ -61,7 +66,7 @@ describe('deliverCampaignLeads', () => {
     vi.mocked(listCampaignLeads).mockResolvedValue({
       totalLeads: 1,
       // Seeded in the mock adapter — see lib/adapters/mock.ts.
-      leads: [{ email: 'jordan.blake@example.com', firstName: 'Jordan', lastName: 'Blake' }],
+      leads: [{ id: 'sl_2', email: 'jordan.blake@example.com', firstName: 'Jordan', lastName: 'Blake' }],
     });
 
     const result = await deliverCampaignLeads(cfg, mockAdapter, 'camp_1', 25);
@@ -73,7 +78,7 @@ describe('deliverCampaignLeads', () => {
   it('reports cappedAt when the campaign has more leads than the requested max', async () => {
     vi.mocked(listCampaignLeads).mockResolvedValue({
       totalLeads: 500,
-      leads: [{ email: 'one-of-many@example.com' }],
+      leads: [{ id: 'sl_3', email: 'one-of-many@example.com' }],
     });
 
     const result = await deliverCampaignLeads(cfg, mockAdapter, 'camp_1', 1);
@@ -86,8 +91,8 @@ describe('deliverCampaignLeads', () => {
     vi.mocked(listCampaignLeads).mockResolvedValue({
       totalLeads: 2,
       leads: [
-        { email: 'will-fail@example.com', firstName: 'Will' },
-        { email: 'will-succeed@example.com', firstName: 'Succeed' },
+        { id: 'sl_4', email: 'will-fail@example.com', firstName: 'Will' },
+        { id: 'sl_5', email: 'will-succeed@example.com', firstName: 'Succeed' },
       ],
     });
     const failingAdapter = {
@@ -107,5 +112,53 @@ describe('deliverCampaignLeads', () => {
       email: 'will-fail@example.com',
       reason: expect.stringContaining('simulated lookup failure'),
     });
+  });
+
+  it('backfills status and real message history as activity for every processed lead', async () => {
+    vi.mocked(listCampaignLeads).mockResolvedValue({
+      totalLeads: 1,
+      leads: [
+        {
+          id: 'sl_6',
+          email: 'jordan.blake@example.com', // already exists — still backfilled
+          sequenceStatus: 'INPROGRESS',
+        },
+      ],
+    });
+    vi.mocked(listLeadMessageHistory).mockResolvedValue([
+      { type: 'SENT', subject: 'Hi there', body: 'First touch', time: '2026-08-18T19:00:00.000Z' },
+      { type: 'REPLY', subject: 'RE: Hi there', body: 'Sure, interested', time: '2026-08-19T10:00:00.000Z' },
+    ]);
+
+    const writeActivitySpy = vi.spyOn(mockAdapter, 'writeActivity');
+    const updateStatusSpy = vi.spyOn(mockAdapter, 'updateStatus');
+
+    const result = await deliverCampaignLeads(cfg, mockAdapter, 'camp_1', 25);
+
+    expect(result.alreadyExisted).toBe(1);
+    expect(result.activitiesLogged).toBe(2);
+    expect(writeActivitySpy).toHaveBeenCalledTimes(2);
+    expect(updateStatusSpy).toHaveBeenCalledWith(
+      expect.anything(),
+      'delivered_inprogress',
+      expect.anything(),
+    );
+
+    writeActivitySpy.mockRestore();
+    updateStatusSpy.mockRestore();
+  });
+
+  it('does not fail the whole lead when activity backfill throws', async () => {
+    vi.mocked(listCampaignLeads).mockResolvedValue({
+      totalLeads: 1,
+      leads: [{ id: 'sl_7', email: 'resilient-lead@example.com', firstName: 'Resilient' }],
+    });
+    vi.mocked(listLeadMessageHistory).mockRejectedValue(new Error('message-history endpoint down'));
+
+    const result = await deliverCampaignLeads(cfg, mockAdapter, 'camp_1', 25);
+
+    expect(result.created).toBe(1);
+    expect(result.errors).toHaveLength(0);
+    expect(result.activitiesLogged).toBe(0);
   });
 });

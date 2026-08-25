@@ -23,20 +23,51 @@ added afterward at Balaaj's request, once writeback was proven against a real Hu
 - `lib/delivery.ts` — the core logic. Reuses `CrmAdapter.findRecord`/`createRecord` unchanged by
   representing a delivered lead as a minimal `CanonicalEvent`-shaped object, rather than inventing
   a parallel contact-creation path.
-- `lib/sources/smartlead-api.ts`'s `listCampaignLeads` — confirmed live against a real account's
-  real campaigns (`GET /campaigns/{id}/leads`), read-only.
+- `lib/sources/smartlead-api.ts`'s `listCampaignLeads` (paginated via offset/limit) and
+  `listLeadMessageHistory` — both confirmed live against a real account's real campaigns and real
+  leads (`GET /campaigns/{id}/leads`, `GET /campaigns/{id}/leads/{leadId}/message-history`),
+  read-only.
 - `POST /api/delivery/run`, wizard step 9 ("Deliver contacts").
-- **Deliberately capped** (`maxLeads`, default 25) and synchronous — same "no durable job queue"
-  decision as the rest of this repo (brief §3). A campaign with thousands of leads needs a real
-  background job runner to deliver in full; this proves the mechanism works, it is not that job
-  runner. Never silently drops leads past the cap — `cappedAt` is always reported.
-- **Verified live** (25 Aug 2026) against Lotus Labs' real Smartlead account (read-only lead
-  fetching, their campaigns untouched) delivering into the HubSpot test portal — never their real
-  CRM. Confirmed: correct field mapping from real lead data, correct dedup on a second run
-  (already-created leads skipped, not duplicated), and results correctly show up in `/log`.
+- **Deliberately capped** (`maxLeads`, default 25, hard ceiling 500) and synchronous — same "no
+  durable job queue" decision as the rest of this repo (brief §3). Paginates across multiple
+  Smartlead pages automatically up to the cap. A campaign with many thousands of leads still
+  needs a real background job runner to deliver in full; this proves the mechanism, it is not
+  that job runner. Never silently drops leads past the cap — `cappedAt` is always reported.
+- **Backfills status and real activity for every processed lead, not just newly-created ones.**
+  Found live, from a real client screenshot: a delivered contact showed no activity, no status,
+  no "last contacted" — because the original version only created the bare contact. Fixed:
+  `deliverCampaignLeads` now also (a) best-effort writes `cymate_writeback_status` from
+  Smartlead's own sequence status (`delivered_<inprogress|completed|paused|...>`), and
+  (b) fetches each lead's real message history and logs every message as a real HubSpot email
+  engagement (see below), not a synthetic placeholder. A sub-step failing (bad history fetch,
+  etc.) doesn't erase a lead that was otherwise found/created successfully — tracked separately
+  in `DeliveryResult.activitiesLogged` and reported per-lead in `/log`.
+- **`writeActivity` now logs real email engagements, not generic notes, for `email_sent`/`reply`.**
+  Brief §10's own original intent ("for email events prefer the emails object") — this skeleton
+  had simplified to notes-only for code-path uniformity; a real client's feedback (an empty
+  activity timeline on a delivered contact) is what prompted actually building it. Confirmed live:
+  `POST /crm/v3/objects/emails` + the same v4 default-association pattern notes use;
+  `hs_email_status` only accepts `BOUNCED/FAILED/SCHEDULED/SENDING/SENT/DRAFT` (confirmed via a
+  live validation error — direction, not status, is what distinguishes outbound/inbound); logging
+  with the real historical `hs_timestamp` is what makes HubSpot's own `notes_last_contacted` (the
+  contact-level "last contacted" HubSpot itself surfaces) populate correctly — confirmed live,
+  no separate field for this adapter to set by hand. Non-email events (bounce, unsubscribe,
+  status_change) still use notes, per the same brief guidance.
+- **Verified live** (25 Aug 2026) against Lotus Labs' real Smartlead account (read-only lead and
+  message-history fetching, their campaigns and running sequences untouched, no webhook
+  registration attempted) delivering into the HubSpot test portal — never their real CRM.
+  Confirmed: correct field mapping from real lead data, correct dedup on a second run
+  (already-created leads skipped, not duplicated, but still status/activity-backfilled), real
+  email engagements correctly associated and visible on the contact, `notes_last_contacted`
+  correctly auto-populated by HubSpot from the logged activity, and results correctly show up in
+  `/log`. Writeback (not just delivery) was also re-verified against real Lotus Labs lead
+  identity/company data through the actual `/api/webhooks/smartlead` production route (not the
+  `/api/test-event` shortcut), confirming the full dispatch decision tree — category promotion to
+  `positive_reply`, the create-on-interested-reply policy, and the status write — all work
+  correctly with real-shaped data end to end.
 - **Still not built**: suppression list sync (a distinct, separate S1 delivery feature, still out
   of scope — see below) and anything resembling a real bulk-import job (progress tracking across
-  requests, resuming a partial import, syncing more than one `maxLeads` batch automatically).
+  requests spanning more than one HTTP call, resuming a partial import that failed midway).
 
 ## Explicitly out of scope (brief §3 / §17) — do not build these here
 

@@ -16,6 +16,10 @@
  *                limit } — used for delivery (lib/delivery.ts). Verified live
  *                against a real account's real campaigns (25 Aug 2026),
  *                read-only, no campaign data modified.
+ *   CONFIRMED    GET /campaigns/{id}/leads/{leadId}/message-history returns
+ *                real sent/reply email content { history: [{ type, subject,
+ *                email_body, time, open_count, click_count }] }. Verified
+ *                live against a real account's real lead (25 Aug 2026).
  *   NOT CONFIRMED  The exact path for listing lead categories.
  *   NOT CONFIRMED  The exact path/payload shape for webhook registration.
  *
@@ -61,6 +65,8 @@ export async function listCampaigns(apiKey: string): Promise<SmartleadCampaign[]
 }
 
 export interface SmartleadLead {
+  /** Smartlead's own lead id — needed for the message-history endpoint. */
+  id: string;
   email: string;
   firstName?: string;
   lastName?: string;
@@ -68,24 +74,26 @@ export interface SmartleadLead {
   title?: string;
   phone?: string;
   linkedinUrl?: string;
+  /** Raw sequence status (e.g. INPROGRESS, COMPLETED, PAUSED) — Smartlead's own term, not a CRM lifecycle stage. */
+  sequenceStatus?: string;
 }
 
 /**
  * Confirmed live (25 Aug 2026) against a real Smartlead account's real
- * campaigns — read-only, does not modify anything about the campaign.
- * Pages through `data` using offset/limit until `limit` leads have been
- * collected or the campaign is exhausted, whichever comes first — callers
- * needing "the whole campaign" for a huge list should raise `limit`
- * deliberately, not assume this fetches everything by default.
+ * campaigns — read-only, does not modify anything about the campaign. One
+ * page per call — `offset`/`limit` let the caller (lib/delivery.ts) page
+ * through a large campaign across several calls rather than assuming this
+ * fetches everything at once.
  */
 export async function listCampaignLeads(
   apiKey: string,
   campaignId: string,
   limit = 100,
+  offset = 0,
 ): Promise<{ leads: SmartleadLead[]; totalLeads: number }> {
   const url = new URL(`${SMARTLEAD_API_BASE}/campaigns/${campaignId}/leads`);
   url.searchParams.set('api_key', apiKey);
-  url.searchParams.set('offset', '0');
+  url.searchParams.set('offset', String(offset));
   url.searchParams.set('limit', String(limit));
 
   const res = await fetch(url);
@@ -95,7 +103,9 @@ export async function listCampaignLeads(
   const body = (await res.json()) as {
     total_leads: string;
     data: Array<{
+      status?: string;
       lead: {
+        id: number | string;
         email: string;
         first_name?: string;
         last_name?: string;
@@ -109,6 +119,7 @@ export async function listCampaignLeads(
   return {
     totalLeads: Number(body.total_leads),
     leads: body.data.map((entry) => ({
+      id: String(entry.lead.id),
       email: entry.lead.email,
       firstName: entry.lead.first_name,
       lastName: entry.lead.last_name,
@@ -116,8 +127,45 @@ export async function listCampaignLeads(
       title: entry.lead.custom_fields?.Title,
       phone: entry.lead.phone_number ?? undefined,
       linkedinUrl: entry.lead.linkedin_profile ?? undefined,
+      sequenceStatus: entry.status,
     })),
   };
+}
+
+export interface SmartleadMessage {
+  /** 'SENT' (outbound) or 'REPLY' (inbound) — confirmed live, 25 Aug 2026. */
+  type: string;
+  subject: string;
+  body: string;
+  time: string;
+}
+
+/**
+ * Confirmed live (25 Aug 2026) against a real lead's real message history —
+ * read-only. The raw response also includes `open_count`/`click_count` per
+ * message; deliberately not read here. Brief §2.3's deliverability rule
+ * forbids *subscribing to* open/click tracking, and while passively reading
+ * a count that happens to be in a response requested for other reasons is a
+ * different mechanism, staying away from it entirely keeps this code
+ * unambiguously on the right side of that rule — nothing downstream ever
+ * sees or acts on open/click data.
+ */
+export async function listLeadMessageHistory(
+  apiKey: string,
+  campaignId: string,
+  leadId: string,
+): Promise<SmartleadMessage[]> {
+  const url = new URL(`${SMARTLEAD_API_BASE}/campaigns/${campaignId}/leads/${leadId}/message-history`);
+  url.searchParams.set('api_key', apiKey);
+
+  const res = await fetch(url);
+  if (!res.ok) {
+    throw new Error(`Smartlead message-history call failed (${res.status}): ${await res.text()}`);
+  }
+  const body = (await res.json()) as {
+    history: Array<{ type: string; subject: string; email_body: string; time: string }>;
+  };
+  return body.history.map((m) => ({ type: m.type, subject: m.subject, body: m.email_body, time: m.time }));
 }
 
 /**

@@ -152,6 +152,7 @@ export default function SetupWizard() {
         processed: number;
         created: number;
         alreadyExisted: number;
+        activitiesLogged: number;
         errors: Array<{ email: string; reason: string }>;
         cappedAt?: number;
       };
@@ -637,13 +638,14 @@ export default function SetupWizard() {
                 <input
                   type="number"
                   min={1}
-                  max={1000}
+                  max={500}
                   className={`mt-2 w-40 ${inputClass}`}
                   value={deliveryMaxLeads}
-                  onChange={(e) => setDeliveryMaxLeads(Math.max(1, Number(e.target.value) || 1))}
+                  onChange={(e) => setDeliveryMaxLeads(Math.min(500, Math.max(1, Number(e.target.value) || 1)))}
                 />
                 <p className="mt-1 text-xs text-slate-500">
-                  Delivering a whole large campaign at once needs a real background job runner,
+                  Paginates across multiple Smartlead pages automatically, up to a hard ceiling of
+                  500 leads per run. Delivering a whole larger campaign at once needs a real background job runner,
                   not built in this skeleton — this cap keeps a single request bounded.
                 </p>
                 <button
@@ -667,7 +669,7 @@ export default function SetupWizard() {
                           <div className="mt-1 text-slate-600">
                             <p>
                               {r.result.created} created · {r.result.alreadyExisted} already existed ·{' '}
-                              {r.result.errors.length} errors
+                              {r.result.activitiesLogged} activities logged · {r.result.errors.length} errors
                               {r.result.cappedAt
                                 ? ` · capped at ${r.result.cappedAt} of ${r.result.totalLeadsInCampaign} total leads`
                                 : ''}

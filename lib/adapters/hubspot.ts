@@ -11,7 +11,10 @@
  *   CONFIRMED   POST  /crm/v3/objects/contacts                           (create, {properties})
  *   CONFIRMED   PATCH /crm/v3/objects/contacts/{contactId}               (update)
  *   CONFIRMED   GET   /crm/v3/properties/{objectType}                   (describe fields)
- *   CONFIRMED   POST  /crm/v3/objects/notes  +  PUT .../associations/default/...  (writeActivity)
+ *   CONFIRMED   POST  /crm/v3/objects/notes  +  PUT .../associations/default/...  (writeActivity, non-email events)
+ *   CONFIRMED   POST  /crm/v3/objects/emails +  PUT .../associations/default/...  (writeActivity, email_sent/reply —
+ *               real email content, not a note; hs_email_status only accepts
+ *               BOUNCED/FAILED/SCHEDULED/SENDING/SENT/DRAFT, confirmed via a live validation error)
  *   CONFIRMED   POST  /crm/v3/properties/{objectType}  (create a missing custom property)
  *
  * Marketing-contact billing risk (brief §10.1) — RESOLVED, not just verified:
@@ -277,16 +280,57 @@ export const hubspotAdapter: CrmAdapter = {
   },
 
   async writeActivity(ref, event, cfg) {
-    // [VERIFY] before DRY_RUN=false — see file header. Uses a note (brief
-    // §10 table: "for other events a note is acceptable") rather than the
-    // dedicated emails engagement object, to keep one code path for every
-    // event type in this skeleton.
+    // Real email content (brief §10 table's original intent: "for email
+    // events prefer the emails object") — confirmed live, 25 Aug 2026:
+    // POST /crm/v3/objects/emails + the same v4 default-association pattern
+    // notes use. hs_email_status only accepts a small fixed set of values
+    // (BOUNCED/FAILED/SCHEDULED/SENDING/SENT/DRAFT — confirmed via a live
+    // validation error) — direction, not status, is what distinguishes
+    // outbound from inbound, so SENT is correct for both. Logging these
+    // with their real historical hs_timestamp is also what makes HubSpot's
+    // own hs_engagements_last_contacted populate correctly — no separate
+    // "last contacted" field for this adapter to set by hand.
+    if (event.type === 'email_sent' || event.type === 'reply') {
+      const createRes = await hubspotFetch(cfg, '/crm/v3/objects/emails', {
+        method: 'POST',
+        body: JSON.stringify({
+          properties: {
+            hs_timestamp: event.occurredAt,
+            hs_email_direction: event.type === 'reply' ? 'INCOMING_EMAIL' : 'EMAIL',
+            hs_email_status: 'SENT',
+            hs_email_subject: event.detail.subject ?? '(no subject)',
+            hs_email_text: event.detail.bodyPreview ?? '',
+          },
+        }),
+      });
+      if (!createRes.ok) {
+        throw new HubspotApiError(
+          createRes.status,
+          `HubSpot writeActivity (create email) failed: ${hubspotErrorSummary(await createRes.text())}`,
+        );
+      }
+      const email = (await createRes.json()) as { id: string };
+
+      const assocRes = await hubspotFetch(
+        cfg,
+        `/crm/v4/objects/emails/${email.id}/associations/default/contacts/${ref.id}`,
+        { method: 'PUT' },
+      );
+      if (!assocRes.ok) {
+        throw new HubspotApiError(
+          assocRes.status,
+          `HubSpot writeActivity (associate email) failed: ${hubspotErrorSummary(await assocRes.text())}`,
+        );
+      }
+      return;
+    }
+
+    // Non-email events (bounce, unsubscribe, status_change) — brief §10
+    // table: "for other events a note is acceptable".
     const noteBody = [
       `Cymate writeback — ${event.type}`,
-      event.detail.subject ? `Subject: ${event.detail.subject}` : null,
       event.detail.category ? `Category: ${event.detail.category}` : null,
       event.detail.bounceReason ? `Bounce reason: ${event.detail.bounceReason}` : null,
-      event.detail.bodyPreview ?? null,
     ]
       .filter(Boolean)
       .join('\n');

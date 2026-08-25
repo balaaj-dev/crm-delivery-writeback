@@ -6,23 +6,37 @@
  * this file is the first part, built afterward at Balaaj's request once
  * writeback was proven against a real HubSpot portal.
  *
- * Bulk-creates CRM contact records from a client's existing Smartlead leads,
- * independent of any triggering event — this is what lets writeback's
- * "partial mode" matching actually find something later (§8 step 5 in the
- * dispatch decision tree needs the record to already exist, or a policy
- * that allows creating it).
- *
- * Deliberately reuses the exact same CrmAdapter.findRecord/createRecord
- * contract writeback already uses, rather than inventing a parallel path —
- * a delivered lead is represented as a minimal CanonicalEvent-shaped object
- * so the adapter's existing field-mapping logic (buildContactProperties in
- * lib/adapters/hubspot.ts) works completely unchanged.
+ * For each lead in the campaign(s) selected, this:
+ *   1. Creates the CRM contact if it doesn't already exist (reusing the
+ *      exact same CrmAdapter.findRecord/createRecord contract writeback
+ *      uses — a lead is represented as a minimal CanonicalEvent-shaped
+ *      object so the adapter's existing field-mapping logic works
+ *      unchanged).
+ *   2. Best-effort backfills the contact's status from Smartlead's own
+ *      sequence status (INPROGRESS/COMPLETED/PAUSED/...).
+ *   3. Best-effort backfills real send/reply history as actual email
+ *      engagements (not generic notes) — see lib/adapters/hubspot.ts's
+ *      writeActivity — so a delivered contact shows real activity instead
+ *      of an empty timeline, and HubSpot's own "last contacted" populates
+ *      itself from the real historical timestamps.
+ * Steps 2 and 3 run for *every* processed lead, not just newly-created
+ * ones — an already-existing contact with no logged activity benefits from
+ * this exactly as much as a brand-new one (this is what a real client asked
+ * for after seeing a delivered contact with an empty activity timeline).
  */
 import type { CanonicalEvent, ClientConfig, CrmAdapter } from './types';
-import { listCampaignLeads, type SmartleadLead } from './sources/smartlead-api';
-import { logger } from './log';
-import { recordEvent } from './log';
+import {
+  listCampaignLeads,
+  listLeadMessageHistory,
+  type SmartleadLead,
+} from './sources/smartlead-api';
+import { logger, recordEvent } from './log';
 import { isDryRun } from './adapters/index';
+
+/** Hard ceiling regardless of the caller's requested maxLeads — a safety backstop, not a target to hit. */
+const HARD_MAX_LEADS = 500;
+/** Smartlead's own page size for listCampaignLeads — paginate in chunks this large up to maxLeads. */
+const PAGE_SIZE = 100;
 
 export interface DeliveryResult {
   campaignId: string;
@@ -30,8 +44,10 @@ export interface DeliveryResult {
   processed: number;
   created: number;
   alreadyExisted: number;
+  /** Real email engagements logged from Smartlead's message history, across all processed leads. */
+  activitiesLogged: number;
   errors: Array<{ email: string; reason: string }>;
-  /** Set when totalLeadsInCampaign > the limit passed in — never silently dropped, always reported. */
+  /** Set when totalLeadsInCampaign > what was actually fetched — never silently dropped, always reported. */
   cappedAt?: number;
 }
 
@@ -61,13 +77,62 @@ function leadToSyntheticEvent(lead: SmartleadLead, clientId: string): CanonicalE
   };
 }
 
+/** Smartlead's raw sequence status -> a value cymate_writeback_status can hold. Just lowercased, kept literal — not a real category, don't conflate with the statusMap's positive_reply/meeting_booked promotions. */
+function deliveryStatusValue(lead: SmartleadLead): string | undefined {
+  return lead.sequenceStatus ? `delivered_${lead.sequenceStatus.toLowerCase()}` : undefined;
+}
+
+function messageToSyntheticEvent(
+  message: { type: string; subject: string; body: string; time: string },
+  lead: SmartleadLead,
+  clientId: string,
+): CanonicalEvent {
+  return {
+    eventId: `delivery-activity:${clientId}:${lead.email}:${message.time}`,
+    occurredAt: message.time,
+    type: message.type === 'REPLY' ? 'reply' : 'email_sent',
+    clientId,
+    source: 'smartlead',
+    campaign: { id: '', name: '' },
+    prospect: { email: lead.email.trim().toLowerCase() },
+    detail: {
+      subject: message.subject,
+      bodyPreview: message.body.slice(0, 2000),
+    },
+    raw: message,
+  };
+}
+
+async function fetchAllLeads(
+  apiKey: string,
+  campaignId: string,
+  maxLeads: number,
+): Promise<{ leads: SmartleadLead[]; totalLeads: number }> {
+  const leads: SmartleadLead[] = [];
+  let totalLeads = 0;
+  let offset = 0;
+
+  while (leads.length < maxLeads) {
+    const pageSize = Math.min(PAGE_SIZE, maxLeads - leads.length);
+    const page = await listCampaignLeads(apiKey, campaignId, pageSize, offset);
+    totalLeads = page.totalLeads;
+    leads.push(...page.leads);
+    offset += page.leads.length;
+    if (page.leads.length === 0 || offset >= totalLeads) break;
+  }
+
+  return { leads, totalLeads };
+}
+
 /**
- * Delivers up to `maxLeads` leads from one campaign in a single request.
- * Capped by default and deliberately synchronous — the brief's own
- * "no durable job queue" decision (§3) applies here too. A campaign with
- * thousands of leads needs a real background job runner to deliver in
- * full; this is a skeleton-grade proof, not that. Never silently drops
- * leads past the cap — `cappedAt` tells the caller more exist.
+ * Delivers up to `maxLeads` leads from one campaign (paginating across
+ * multiple Smartlead calls as needed, up to `HARD_MAX_LEADS` regardless of
+ * what's requested). Deliberately synchronous, in one request — the
+ * brief's own "no durable job queue" decision (§3) applies here too. A
+ * campaign with many thousands of leads needs a real background job
+ * runner to deliver in full; this proves the mechanism, it is not that job
+ * runner. Never silently drops leads past the cap — `cappedAt` tells the
+ * caller more exist.
  */
 export async function deliverCampaignLeads(
   cfg: ClientConfig,
@@ -75,7 +140,8 @@ export async function deliverCampaignLeads(
   campaignId: string,
   maxLeads = 25,
 ): Promise<DeliveryResult> {
-  const { leads, totalLeads } = await listCampaignLeads(cfg.source.apiKey, campaignId, maxLeads);
+  const effectiveMax = Math.min(maxLeads, HARD_MAX_LEADS);
+  const { leads, totalLeads } = await fetchAllLeads(cfg.source.apiKey, campaignId, effectiveMax);
   const dryRun = isDryRun();
 
   const result: DeliveryResult = {
@@ -84,9 +150,10 @@ export async function deliverCampaignLeads(
     processed: 0,
     created: 0,
     alreadyExisted: 0,
+    activitiesLogged: 0,
     errors: [],
   };
-  if (totalLeads > maxLeads) result.cappedAt = maxLeads;
+  if (totalLeads > leads.length) result.cappedAt = leads.length;
 
   for (const lead of leads) {
     result.processed += 1;
@@ -99,16 +166,50 @@ export async function deliverCampaignLeads(
       dryRun,
     };
     try {
-      const existing = await adapter.findRecord(lead.email, cfg);
-      if (existing) {
+      let ref = await adapter.findRecord(lead.email, cfg);
+      if (ref) {
         result.alreadyExisted += 1;
-        await recordEvent({ ...baseLog, outcome: 'skip', reason: 'already_exists' });
-        continue;
+      } else {
+        const event = leadToSyntheticEvent(lead, cfg.clientId);
+        ref = await adapter.createRecord(event, cfg);
+        result.created += 1;
       }
-      const event = leadToSyntheticEvent(lead, cfg.clientId);
-      const ref = await adapter.createRecord(event, cfg);
-      result.created += 1;
-      await recordEvent({ ...baseLog, outcome: 'success', detail: { ref } });
+
+      // Best-effort from here — a failure backfilling status/activity
+      // shouldn't erase the fact that the contact itself was successfully
+      // found/created above.
+      const statusValue = deliveryStatusValue(lead);
+      if (statusValue) {
+        try {
+          await adapter.updateStatus(ref, statusValue, cfg);
+        } catch (err) {
+          logger.warn('delivery: status backfill failed', {
+            email: lead.email,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
+
+      let leadActivitiesLogged = 0;
+      try {
+        const history = await listLeadMessageHistory(cfg.source.apiKey, campaignId, lead.id);
+        for (const message of history) {
+          await adapter.writeActivity(ref, messageToSyntheticEvent(message, lead, cfg.clientId), cfg);
+          leadActivitiesLogged += 1;
+        }
+        result.activitiesLogged += leadActivitiesLogged;
+      } catch (err) {
+        logger.warn('delivery: activity backfill failed', {
+          email: lead.email,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+
+      await recordEvent({
+        ...baseLog,
+        outcome: 'success',
+        detail: { ref, activitiesLogged: leadActivitiesLogged },
+      });
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
       logger.warn('delivery: failed to create record for lead', { email: lead.email, reason });
