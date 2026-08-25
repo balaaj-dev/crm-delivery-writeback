@@ -49,6 +49,14 @@ filling in Airtable fields, not writing code.
   what to add by hand; until then, every client resolves to `activated: false` via
   `lib/airtable.ts`'s safe defaults, and `fixtures/clients.json` is what actually exercises the
   app end-to-end.
+- **The wizard never collects `source.campaignIds`.** Neither the build brief's §13 step list nor
+  this implementation has a step for picking which Smartlead campaigns to sync — `runBuild()` in
+  `app/setup/page.tsx` just carries over whatever `campaignIds` the client's existing config
+  already has (empty for every fixture). `POST /api/webhooks/register` requires a non-empty list
+  and fails cleanly with a clear message when it's empty, so this doesn't fail silently — but it
+  does mean a CSM can walk through all 10 steps and hit a dead end at "Review and build" with no
+  way to fix it from the UI. Needs a new step: fetch the client's live Smartlead campaigns and let
+  the CSM multi-select them.
 
 ## Design decision: how DRY_RUN actually routes calls (deviates from a literal reading of brief §11)
 
@@ -70,6 +78,49 @@ dispatch decision tree itself, independent of any one real CRM's shape.
 If a future CRM adapter is added, follow the HubSpot pattern (DRY_RUN-aware at the HTTP layer),
 not a mock-swap — see `docs/ADDING-A-CRM.md`.
 
+## Live HubSpot test — 25 Aug 2026 (real portal, real writes, DRY_RUN=false)
+
+Tested against a real free HubSpot portal using a Service Key (HubSpot's current replacement for
+what used to be called a Private App — same Bearer-token auth transport, renamed app-management
+UI; `pat-na2-...` token format confirmed unchanged). Findings, all confirmed by re-fetching the
+actual objects from HubSpot's API afterward, not just by reading a 200 response:
+
+- **The marketing-contact billing risk (brief §10.1) is a non-issue, confirmed two ways.**
+  `hs_marketable_status` is a read-only property via the API (`modificationMetadata.readOnlyValue: true`,
+  confirmed via a live `GET /crm/v3/properties/contacts/hs_marketable_status`) — attempting to set
+  it on create is silently ignored, not an error. And per HubSpot's own docs, *"Any integration or
+  API sets contacts as non-marketing by default"*
+  (https://knowledge.hubspot.com/contacts/default-marketing-statuses-for-created-contacts). The
+  code that tried to set this property has been **removed** — it never did anything, and nothing
+  needs to replace it.
+- **`cymate_writeback_status` does not exist on a fresh portal and must be created.** The first
+  `updateStatus` PATCH against a real client hits `PROPERTY_DOESNT_EXIST`. Fixed:
+  `lib/adapters/hubspot.ts`'s `updateStatus` now self-heals — on that specific error it creates
+  the property (`POST /crm/v3/properties/contacts`, plain single-line text) and retries once. No
+  manual HubSpot setup step is required per client; confirmed the retry succeeds and the property
+  persists correctly for later events on the same portal.
+- **`crm.objects.deals.write` is a real, separate scope requirement**, not covered by
+  `crm.objects.contacts.write`. Confirmed live: `createDeal` failed with
+  `MISSING_SCOPES` (`crm.objects.deals.write` specifically) on a Service Key that only had the
+  contacts/schemas scopes. Anyone setting up a client's Service Key needs this scope *only if*
+  `behaviour.createDeal` will be turned on for them — otherwise skip it, per least-privilege.
+- **Confirmed working end-to-end, real objects verified via GET afterward:** `findRecord` (real
+  404 → not-found), `createRecord` (contact created with correct field-mapped properties),
+  `writeActivity` (note created **and** correctly associated to the contact via the v4 default
+  association endpoint), `updateStatus` (after the self-heal above).
+- **New gap found via this test, not yet fixed:** when a later step in `dispatch.ts`'s sequence
+  throws (e.g. `createDeal` failing on missing scopes) *after* earlier steps in the same dispatch
+  call already succeeded (contact created, note written, status updated), the whole event is
+  logged with `outcome: 'error'` and **the successful actions are not recorded anywhere** — the
+  `DispatchOutcome` error variant has no `actions` field, unlike the success variant. `/log` will
+  show "error" for an event that mostly worked, which is misleading for exactly the kind of
+  visibility this app exists to provide (brief §8: "no\_record\_no\_create\_policy in particular
+  will be common... must be visible, not hidden" — the same principle applies to partial success).
+  Also: `markProcessed(event.eventId)` runs before the try block, so a retry of the *same* event
+  after a partial failure is skipped as a duplicate rather than retried — the deal, in this
+  example, never gets created on retry. Worth fixing: include `actions` on the error outcome, and
+  reconsider whether partial failures should still count as "processed" for idempotency purposes.
+
 ## Unresolved [VERIFY] items — confirm against live vendor docs/accounts before DRY_RUN=false
 
 | Item | Where | Status |
@@ -78,16 +129,19 @@ not a mock-swap — see `docs/ADDING-A-CRM.md`.
 | Smartlead webhook signature/verification mechanism | `app/api/webhooks/smartlead/route.ts` | Not implemented at all — `SMARTLEAD_WEBHOOK_SECRET` is an unused env var placeholder. This endpoint is not verified against payload spoofing. |
 | Smartlead webhook-registration endpoint + payload shape | `lib/sources/smartlead-api.ts` `registerSmartleadWebhook` | Best-guess path under the confirmed `server.smartlead.ai/api/v1` base. Path itself unconfirmed. |
 | Smartlead lead-categories endpoint | `lib/sources/smartlead-api.ts` `listLeadCategories` | Same — confirmed base URL/auth style (`?api_key=` query param, **not** a bearer token — this was a real correction made during this build, see below), unconfirmed path. Fails soft to default suggestions in the wizard. |
-| HubSpot non-marketing-contact property/mechanism | `lib/adapters/hubspot.ts` `MARKETING_STATUS_PROPERTY` | Implemented using `hs_marketable_status: 'false'` as the best-known mechanism. **Not confirmed live** — HubSpot's docs site 404'd the specific page checked during this build. This is a real financial-risk item (brief §10.1) — verify against a real HubSpot portal before any HubSpot client goes to `DRY_RUN=false`. |
-| HubSpot notes-create + v4 default-association endpoint shape | `lib/adapters/hubspot.ts` `writeActivity`/`createDeal` | Same — docs 404'd live during this build. Implemented using the well-established `POST /crm/v3/objects/notes` + `PUT /crm/v4/objects/{type}/{id}/associations/default/{toType}/{toId}` pattern from HubSpot's general API conventions, not confirmed against the current docs in this pass. |
 | HubSpot rate limits | `lib/adapters/hubspot.ts` | Not checked live. Implemented: serial requests, single 429 retry with a 1s delay, no backoff system (by design — full backoff is out of scope). |
 
-**What WAS confirmed live during this build** (via HubSpot's and Smartlead's public developer
-docs, so worth recording rather than re-checking):
+**What WAS confirmed live** (via HubSpot's/Smartlead's public docs and, for HubSpot, an actual
+test portal — see the section above — so worth recording rather than re-checking):
 - HubSpot: `GET /crm/v3/objects/contacts/{email}?idProperty=email` (find by email — simpler and
   more confirmed than a `/search` call, used instead of the brief's suggested search endpoint),
   `POST /crm/v3/objects/contacts` (create), `PATCH /crm/v3/objects/contacts/{id}` (update),
-  `GET /crm/v3/properties/{objectType}` (describe fields).
+  `GET /crm/v3/properties/{objectType}` (describe fields), `POST /crm/v3/objects/notes` +
+  `PUT /crm/v4/objects/notes/{id}/associations/default/contacts/{id}` (writeActivity),
+  `POST /crm/v3/properties/{objectType}` (create a missing custom property).
+- HubSpot's "Private Apps" UI has been renamed/replaced by "Service Keys" as of this pass — same
+  underlying Bearer-token auth, no code changes needed, but future setup instructions for CSMs
+  should say "Service Key" not "Private App".
 - Smartlead: the real API host is `server.smartlead.ai/api/v1` — **not** `api.smartlead.ai`
   (that host serves the docs site only). Auth is an `api_key` query parameter, not a bearer
   token. This corrected an assumption that would otherwise have shipped wrong.

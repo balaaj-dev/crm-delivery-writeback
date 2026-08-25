@@ -1,24 +1,28 @@
 /**
  * HubSpot adapter — the one that must actually work (brief §10).
  *
- * Auth: HubSpot Private App access token, read from
- * cfg.crm.credentials.accessToken, sent as `Authorization: Bearer <token>`.
+ * Auth: HubSpot Private App / Service Key access token (still a Bearer
+ * token — HubSpot rebranded the app-management UI but not the API auth
+ * transport), read from cfg.crm.credentials.accessToken.
  *
- * Verification status (checked against developers.hubspot.com on 19 Aug
- * 2026 — see docs/HANDOVER.md for the full trail):
+ * Verification status — CONFIRMED LIVE against a real HubSpot portal on
+ * 25 Aug 2026 (see docs/HANDOVER.md for the full trail):
  *   CONFIRMED   GET   /crm/v3/objects/contacts/{email}?idProperty=email  (find by email)
  *   CONFIRMED   POST  /crm/v3/objects/contacts                           (create, {properties})
  *   CONFIRMED   PATCH /crm/v3/objects/contacts/{contactId}               (update)
  *   CONFIRMED   GET   /crm/v3/properties/{objectType}                   (describe fields)
- *   NOT CONFIRMED  the notes-create endpoint + v4 default-association endpoint shape
- *                  (HubSpot's docs site 404'd the pages checked live in this pass)
- *   NOT CONFIRMED  the exact mechanism for marking a contact non-marketing
+ *   CONFIRMED   POST  /crm/v3/objects/notes  +  PUT .../associations/default/...  (writeActivity)
+ *   CONFIRMED   POST  /crm/v3/properties/{objectType}  (create a missing custom property)
  *
- * The two NOT CONFIRMED items are implemented below using the best-known
- * shape from general HubSpot API conventions, but — per brief rule #1 —
- * must be re-verified against live HubSpot docs (or a real sandbox account)
- * before DRY_RUN is ever set to false for a HubSpot client. Do not treat
- * this file as verified for those two calls.
+ * Marketing-contact billing risk (brief §10.1) — RESOLVED, not just verified:
+ * `hs_marketable_status` is a read-only property (confirmed via a live
+ * GET .../properties/contacts/hs_marketable_status — modificationMetadata.readOnlyValue
+ * is true) and cannot be set through the standard properties write; HubSpot
+ * silently ignores it rather than erroring. That's fine, because per
+ * HubSpot's own docs, "Any integration or API sets contacts as non-marketing
+ * by default" — https://knowledge.hubspot.com/contacts/default-marketing-statuses-for-created-contacts.
+ * There is nothing for this adapter to do here; do not re-add a write to
+ * this property.
  */
 import type { CanonicalEvent, ClientConfig, CrmAdapter, CrmFieldDescriptor } from '../types';
 import { logger } from '../log';
@@ -26,23 +30,20 @@ import { logger } from '../log';
 const HUBSPOT_API_BASE = 'https://api.hubapi.com';
 
 /**
- * The custom property this adapter writes lifecycle/status updates to.
+ * The custom property this adapter writes lifecycle/status updates to. It
+ * does not exist by default on any portal — confirmed live (25 Aug 2026):
+ * the first PATCH against a fresh portal failed with PROPERTY_DOESNT_EXIST.
+ * `updateStatus` below self-heals by creating it on first use per portal,
+ * so no manual HubSpot setup step is required per client.
  *
- * Open item (brief §18.1, unresolved — ask Balaaj, do not guess): should
- * status updates instead drive `lifecyclestage`, `hs_lead_status`, or this
- * custom property? The brief's own recommendation is a custom property "so
- * we never fight their marketing automation" — that is the default
- * implemented here. Confirm before relying on this in a real client.
+ * Open item (brief §18.1, still genuinely unresolved — ask Balaaj, do not
+ * guess): should status updates instead drive `lifecyclestage` or
+ * `hs_lead_status` — HubSpot's own native fields — instead of this custom
+ * property? The brief's own recommendation is a custom property "so we
+ * never fight their marketing automation" — that is the default
+ * implemented here. Confirm before relying on this for a real client.
  */
 const CYMATE_STATUS_PROPERTY = 'cymate_writeback_status';
-
-/**
- * [VERIFY] before DRY_RUN=false — see file header. Best-known property for
- * HubSpot's Marketing Contacts feature. Setting this incorrectly either does
- * nothing (contact silently becomes/stays a paid marketing contact) or
- * errors — verify against a real portal before trusting it.
- */
-const MARKETING_STATUS_PROPERTY = 'hs_marketable_status';
 
 class HubspotApiError extends Error {
   constructor(
@@ -142,6 +143,35 @@ function fieldMapValue(event: CanonicalEvent, canonicalPath: string): string | u
   return typeof value === 'string' ? value : undefined;
 }
 
+/**
+ * Creates CYMATE_STATUS_PROPERTY as a plain single-line text property if it
+ * doesn't already exist on this portal. Text, not an enum, because status
+ * values come from the client's own statusMap (brief §7.5) and are
+ * open-ended per client — see fixtures/clients.json for examples like
+ * "positive_reply", "nurture", "closed_lost".
+ */
+async function ensureCymateStatusProperty(cfg: ClientConfig): Promise<void> {
+  const res = await hubspotFetch(cfg, '/crm/v3/properties/contacts', {
+    method: 'POST',
+    body: JSON.stringify({
+      name: CYMATE_STATUS_PROPERTY,
+      label: 'Cymate writeback status',
+      type: 'string',
+      fieldType: 'text',
+      groupName: 'contactinformation',
+      description:
+        "Status value written by Cymate's CRM writeback service, driven by the client's Smartlead lead-category mapping.",
+    }),
+  });
+  // 409 = another concurrent request already created it — not an error.
+  if (!res.ok && res.status !== 409) {
+    throw new HubspotApiError(
+      res.status,
+      `HubSpot: failed to create ${CYMATE_STATUS_PROPERTY} property: ${await res.text()}`,
+    );
+  }
+}
+
 function buildContactProperties(event: CanonicalEvent, cfg: ClientConfig): Record<string, string> {
   const properties: Record<string, string> = {};
   for (const mapping of cfg.fieldMap) {
@@ -186,13 +216,10 @@ export const hubspotAdapter: CrmAdapter = {
   async createRecord(event, cfg) {
     const properties = buildContactProperties(event, cfg);
 
-    // Billing safeguard (brief §10.1): default every contact created by this
-    // service to non-marketing so bulk writeback doesn't silently inflate a
-    // client's HubSpot invoice. [VERIFY] — see file header. Do not remove
-    // this without confirming the correct mechanism first.
-    if (cfg.crm.credentials.treatAsMarketingContacts !== 'true') {
-      properties[MARKETING_STATUS_PROPERTY] = 'false';
-    }
+    // Billing safeguard (brief §10.1): confirmed resolved, not something
+    // this adapter needs to do — see file header. HubSpot defaults every
+    // API-created contact to non-marketing on its own, and the property
+    // that would flag otherwise is read-only via the API regardless.
 
     const res = await hubspotFetch(cfg, '/crm/v3/objects/contacts', {
       method: 'POST',
@@ -202,7 +229,7 @@ export const hubspotAdapter: CrmAdapter = {
       throw new HubspotApiError(res.status, `HubSpot createRecord failed: ${await res.text()}`);
     }
     const body = (await res.json()) as { id: string };
-    logger.info('hubspot: created contact', { id: body.id, nonMarketing: true });
+    logger.info('hubspot: created contact', { id: body.id });
     return { objectType: 'contact', id: body.id, url: `https://app.hubspot.com/contacts/${body.id}` };
   },
 
@@ -252,10 +279,26 @@ export const hubspotAdapter: CrmAdapter = {
   },
 
   async updateStatus(ref, status, cfg) {
-    const res = await hubspotFetch(cfg, `/crm/v3/objects/contacts/${ref.id}`, {
-      method: 'PATCH',
-      body: JSON.stringify({ properties: { [CYMATE_STATUS_PROPERTY]: status } }),
-    });
+    const patch = () =>
+      hubspotFetch(cfg, `/crm/v3/objects/contacts/${ref.id}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ properties: { [CYMATE_STATUS_PROPERTY]: status } }),
+      });
+
+    let res = await patch();
+    if (!res.ok) {
+      const detail = await res.text();
+      if (detail.includes('PROPERTY_DOESNT_EXIST')) {
+        // Self-heals per portal (confirmed necessary live, 25 Aug 2026 — see
+        // file header): the first client on a fresh HubSpot portal always
+        // hits this once, then never again for that portal.
+        logger.info('hubspot: creating missing custom property', { property: CYMATE_STATUS_PROPERTY });
+        await ensureCymateStatusProperty(cfg);
+        res = await patch();
+      } else {
+        throw new HubspotApiError(res.status, `HubSpot updateStatus failed: ${detail}`);
+      }
+    }
     if (!res.ok) {
       throw new HubspotApiError(res.status, `HubSpot updateStatus failed: ${await res.text()}`);
     }
