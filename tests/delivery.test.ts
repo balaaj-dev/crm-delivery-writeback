@@ -6,9 +6,14 @@ import type { ClientConfig } from '@/lib/types';
 vi.mock('@/lib/sources/smartlead-api', () => ({
   listCampaignLeads: vi.fn(),
   listLeadMessageHistory: vi.fn(),
+  resolveInterestCategoryIds: vi.fn(),
 }));
 
-import { listCampaignLeads, listLeadMessageHistory } from '@/lib/sources/smartlead-api';
+import {
+  listCampaignLeads,
+  listLeadMessageHistory,
+  resolveInterestCategoryIds,
+} from '@/lib/sources/smartlead-api';
 
 const cfg: ClientConfig = {
   clientId: 'rec_test',
@@ -41,6 +46,7 @@ beforeEach(() => {
   resetMockAdapterState();
   vi.mocked(listCampaignLeads).mockReset();
   vi.mocked(listLeadMessageHistory).mockReset();
+  vi.mocked(resolveInterestCategoryIds).mockReset();
   // Default: no history, so tests that don't care about activity backfill
   // don't need to stub it explicitly every time.
   vi.mocked(listLeadMessageHistory).mockResolvedValue([]);
@@ -160,5 +166,66 @@ describe('deliverCampaignLeads', () => {
     expect(result.created).toBe(1);
     expect(result.errors).toHaveLength(0);
     expect(result.activitiesLogged).toBe(0);
+  });
+
+  describe('partial mode — interest-category filtering', () => {
+    const partialCfg: ClientConfig = {
+      ...cfg,
+      mode: 'partial',
+      statusMap: {
+        Interested: 'positive_reply',
+        'Meeting Booked': 'meeting_booked',
+        'Not Interested': 'closed_lost',
+      },
+    };
+
+    it('only delivers leads whose live category maps to positive_reply/meeting_booked — real incident regression (Tracie Cranford, 25 Aug 2026): a bounced, never-replied lead was wrongly delivered and marked a Lead', async () => {
+      vi.mocked(resolveInterestCategoryIds).mockResolvedValue(new Set([1, 2])); // Interested=1, Meeting Booked=2
+      vi.mocked(listCampaignLeads).mockResolvedValue({
+        totalLeads: 3,
+        leads: [
+          { id: 'sl_10', email: 'interested@example.com', leadCategoryId: 1 },
+          { id: 'sl_11', email: 'never-replied-bounced@example.com', leadCategoryId: null },
+          { id: 'sl_12', email: 'not-interested@example.com', leadCategoryId: 9 },
+        ],
+      });
+
+      const result = await deliverCampaignLeads(partialCfg, mockAdapter, 'camp_1', 25);
+
+      expect(result.processed).toBe(1);
+      expect(result.created).toBe(1);
+      expect(result.skippedNotInterested).toBe(2);
+      expect(await mockAdapter.findRecord('never-replied-bounced@example.com', partialCfg)).toBeNull();
+      expect(await mockAdapter.findRecord('not-interested@example.com', partialCfg)).toBeNull();
+    });
+
+    it('delivers every lead in full mode regardless of category (unchanged behaviour)', async () => {
+      vi.mocked(listCampaignLeads).mockResolvedValue({
+        totalLeads: 2,
+        leads: [
+          { id: 'sl_13', email: 'no-category-a@example.com', leadCategoryId: null },
+          { id: 'sl_14', email: 'no-category-b@example.com', leadCategoryId: null },
+        ],
+      });
+
+      const result = await deliverCampaignLeads(cfg, mockAdapter, 'camp_1', 25); // cfg.mode === 'full'
+
+      expect(resolveInterestCategoryIds).not.toHaveBeenCalled();
+      expect(result.processed).toBe(2);
+      expect(result.created).toBe(2);
+      expect(result.skippedNotInterested).toBe(0);
+    });
+
+    it('refuses to deliver rather than risk over-delivering when the category lookup itself fails', async () => {
+      vi.mocked(resolveInterestCategoryIds).mockRejectedValue(new Error('categories endpoint down'));
+      vi.mocked(listCampaignLeads).mockResolvedValue({
+        totalLeads: 1,
+        leads: [{ id: 'sl_15', email: 'someone@example.com', leadCategoryId: 1 }],
+      });
+
+      await expect(deliverCampaignLeads(partialCfg, mockAdapter, 'camp_1', 25)).rejects.toThrow(
+        'categories endpoint down',
+      );
+    });
   });
 });

@@ -28,6 +28,7 @@ import type { CanonicalEvent, ClientConfig, CrmAdapter } from './types';
 import {
   listCampaignLeads,
   listLeadMessageHistory,
+  resolveInterestCategoryIds,
   type SmartleadLead,
 } from './sources/smartlead-api';
 import { logger, recordEvent } from './log';
@@ -49,6 +50,8 @@ export interface DeliveryResult {
   errors: Array<{ email: string; reason: string }>;
   /** Set when totalLeadsInCampaign > what was actually fetched — never silently dropped, always reported. */
   cappedAt?: number;
+  /** Partial mode only — leads fetched but not delivered because their live Smartlead category isn't Interested/Meeting Booked. */
+  skippedNotInterested: number;
 }
 
 function leadToSyntheticEvent(lead: SmartleadLead, clientId: string): CanonicalEvent {
@@ -144,6 +147,25 @@ export async function deliverCampaignLeads(
   const { leads, totalLeads } = await fetchAllLeads(cfg.source.apiKey, campaignId, effectiveMax);
   const dryRun = isDryRun();
 
+  // Partial mode's entire premise (see types.ts's MODE_PRESETS comment) is
+  // that a CRM record only gets created on a genuine interest signal — a
+  // real incident (25 Aug 2026, Lotus Labs' Tracie Cranford: bounced, never
+  // replied, still delivered as a Lead) confirmed delivery wasn't actually
+  // enforcing that. Full mode has no such restriction by design.
+  let interestCategoryIds: Set<number> | null = null;
+  if (cfg.mode === 'partial') {
+    try {
+      interestCategoryIds = await resolveInterestCategoryIds(cfg.source.apiKey, cfg.statusMap);
+    } catch (err) {
+      // Fail safe, not fail open — if we can't verify which categories mean
+      // "interested", refuse to deliver rather than risk creating CRM
+      // contacts for leads with no real interest signal.
+      throw new Error(
+        `Partial-mode delivery needs Smartlead's lead categories to filter for Interested/Meeting Booked leads, and that lookup failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
   const result: DeliveryResult = {
     campaignId,
     totalLeadsInCampaign: totalLeads,
@@ -152,11 +174,11 @@ export async function deliverCampaignLeads(
     alreadyExisted: 0,
     activitiesLogged: 0,
     errors: [],
+    skippedNotInterested: 0,
   };
   if (totalLeads > leads.length) result.cappedAt = leads.length;
 
   for (const lead of leads) {
-    result.processed += 1;
     const baseLog = {
       timestamp: new Date().toISOString(),
       clientId: cfg.clientId,
@@ -165,6 +187,14 @@ export async function deliverCampaignLeads(
       eventId: `delivery:${cfg.clientId}:${lead.email}`,
       dryRun,
     };
+
+    if (interestCategoryIds && !(lead.leadCategoryId != null && interestCategoryIds.has(lead.leadCategoryId))) {
+      result.skippedNotInterested += 1;
+      await recordEvent({ ...baseLog, outcome: 'skip', reason: 'not_interested_category' });
+      continue;
+    }
+
+    result.processed += 1;
     try {
       let ref = await adapter.findRecord(lead.email, cfg);
       if (ref) {

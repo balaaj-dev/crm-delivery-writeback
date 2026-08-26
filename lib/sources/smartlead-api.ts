@@ -15,7 +15,10 @@
  *                via offset/limit, response shape { total_leads, data, offset,
  *                limit } — used for delivery (lib/delivery.ts). Verified live
  *                against a real account's real campaigns (25 Aug 2026),
- *                read-only, no campaign data modified.
+ *                read-only, no campaign data modified. Each entry also
+ *                carries `lead_category_id` (confirmed live, 25 Aug 2026,
+ *                null until Smartlead triages the lead) — this is what
+ *                resolveInterestCategoryIds below filters delivery on.
  *   CONFIRMED    GET /campaigns/{id}/leads/{leadId}/message-history returns
  *                real sent/reply email content { history: [{ type, subject,
  *                email_body, time, open_count, click_count }] }. Verified
@@ -76,6 +79,8 @@ export interface SmartleadLead {
   linkedinUrl?: string;
   /** Raw sequence status (e.g. INPROGRESS, COMPLETED, PAUSED) — Smartlead's own term, not a CRM lifecycle stage. */
   sequenceStatus?: string;
+  /** Smartlead's own lead-category id for this campaign (null until the lead replies/gets triaged) — see resolveInterestCategoryIds. */
+  leadCategoryId?: number | null;
 }
 
 /**
@@ -104,6 +109,7 @@ export async function listCampaignLeads(
     total_leads: string;
     data: Array<{
       status?: string;
+      lead_category_id?: number | null;
       lead: {
         id: number | string;
         email: string;
@@ -128,6 +134,7 @@ export async function listCampaignLeads(
       phone: entry.lead.phone_number ?? undefined,
       linkedinUrl: entry.lead.linkedin_profile ?? undefined,
       sequenceStatus: entry.status,
+      leadCategoryId: entry.lead_category_id ?? null,
     })),
   };
 }
@@ -185,6 +192,37 @@ export async function listLeadCategories(apiKey: string): Promise<SmartleadLeadC
     );
   }
   return (await res.json()) as SmartleadLeadCategory[];
+}
+
+/**
+ * Resolves which of a workspace's live Smartlead lead-category IDs count as
+ * a genuine interest signal for one client, per that client's own statusMap
+ * (brief §7.5) — the same mapping the writeback path already uses to
+ * promote a status_change event to positive_reply/meeting_booked (see
+ * resolveEffectiveEventType in lib/dispatch.ts). Used by delivery
+ * (lib/delivery.ts, lib/jobs.ts) to decide, in partial mode, which leads are
+ * even worth creating a CRM contact for.
+ *
+ * Real incident this fixes (25 Aug 2026): partial-mode delivery was
+ * creating a HubSpot contact for every lead in a campaign regardless of
+ * category — confirmed against a real Lotus Labs lead (Tracie Cranford)
+ * who only ever bounced (never replied) but still got delivered and
+ * incorrectly flagged as a positive-reply Lead. This is what
+ * `lead.leadCategoryId` (see listCampaignLeads) is filtered against.
+ */
+export async function resolveInterestCategoryIds(
+  apiKey: string,
+  statusMap: Record<string, string>,
+): Promise<Set<number>> {
+  const categories = await listLeadCategories(apiKey);
+  const ids = new Set<number>();
+  for (const category of categories) {
+    const mapped = statusMap[category.name];
+    if (mapped === 'positive_reply' || mapped === 'meeting_booked') {
+      ids.add(Number(category.id));
+    }
+  }
+  return ids;
 }
 
 /**

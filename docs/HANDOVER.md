@@ -213,6 +213,51 @@ actual objects from HubSpot's API afterward, not just by reading a 200 response:
   off against the concurrent-duplicate-delivery protection idempotency exists for in the first
   place — a real design decision, not a one-line fix.
 
+## Live incident — partial-mode delivery ignored lead category (25 Aug 2026)
+
+Found via a real Lotus Labs contact (Tracie Cranford, `tcranford@archgroup.com`) showing up in the
+test HubSpot portal as a "Lead" despite never having replied — her only real Smartlead activity was
+a bounce (`lead_category_id: 9`, name `"Sender Originated Bounce"`, confirmed via
+`GET /leads/fetch-categories` — see below). Root cause: `deliverCampaignLeads` (`lib/delivery.ts`)
+and the background job runner (`lib/jobs.ts`) created a CRM contact for **every** lead returned by
+`GET /campaigns/{id}/leads`, with no regard for `cfg.mode` or the lead's actual category — this
+defeats partial mode's entire premise (create a record only on a genuine interest signal).
+
+**Fixed:** both files now call `resolveInterestCategoryIds` (new, `lib/sources/smartlead-api.ts`)
+in partial mode, which resolves the client's own `statusMap` against the workspace's live
+categories and only proceeds for leads whose `lead_category_id` maps to `positive_reply` or
+`meeting_booked`. Full mode is unchanged (delivers everyone, by design). If the categories lookup
+itself fails, delivery now throws rather than silently delivering everyone — fail safe, not fail
+open. `lead_category_id` (confirmed live in the `GET /campaigns/{id}/leads` response, previously
+discarded) now flows through `SmartleadLead`. Regression tests in `tests/delivery.test.ts`.
+
+**Re-verified against Lotus Labs' 8 currently-ACTIVE campaigns** (not the ~72 draft/subsequence
+campaigns Smartlead auto-generates alongside them), real reads, real writes to the test HubSpot
+portal only, `DRY_RUN=false` for the duration of the run only: **10,579 leads scanned across all 8
+campaigns, only 5 leads had a live category of Interested/Meeting Request, and only those 5 became
+HubSpot contacts** (0 errors, 32 real email engagements logged — both outreach and reply content —
+across the 5). Before this fix, all 10,579 would have been created. Tracie's stale test data
+(`cymate_writeback_status` incorrectly showing "Interested" from an earlier ad hoc synthetic test
+event fired to debug a separate missing-activity issue) was corrected to `"bounced"`; her
+`lifecyclestage` remains HubSpot's own native `lead` — this app has never written to that field, so
+there's nothing in our code to fix there, and it's a disposable test portal.
+
+## Live incident — Airtable client dropdown returned zero clients (25 Aug 2026)
+
+With a real `AIRTABLE_API_KEY` and `CONFIG_SOURCE=airtable`, `GET /api/clients` returned `{clients:
+[]}` — no error, just empty. Root cause: `activeStatusFilter` in `lib/airtable.ts` compared the
+Status field with `=== 'active'`, but the live base's actual option text is `'✅ Active'` (with an
+emoji prefix) — confirmed by fetching the base directly (real values: `✅ Active`, `❌ Inactive`,
+`🔄 Churning`, `🌙 Paused`, `⛵️Other`). Fixed by stripping non-letter characters before comparing
+(not a plain `.includes('active')` — `'Inactive'` contains that substring too and must not match).
+Confirmed live afterward: 30 real active clients now populate the wizard's dropdown.
+
+Separately, `lib/config.ts`'s `applySessionOverrides` only ever replaced an existing client in the
+list — a session override for a clientId not already present (e.g. testing a real Airtable client,
+like Lotus Labs, whose Status isn't "Active" yet) silently vanished. Fixed to append any override
+that doesn't match an existing entry, since the whole point of a session override is testing a
+client outside the base list's normal filtering.
+
 ## Unresolved [VERIFY] items — confirm against live vendor docs/accounts before DRY_RUN=false
 
 | Item | Where | Status |
@@ -220,7 +265,7 @@ actual objects from HubSpot's API afterward, not just by reading a 200 response:
 | Exact Smartlead webhook payload shape per event | `lib/sources/smartlead.ts` | Built against a documented, reasonable assumption. Not confirmed live. |
 | Smartlead webhook signature/verification mechanism | `app/api/webhooks/smartlead/route.ts` | Not implemented at all — `SMARTLEAD_WEBHOOK_SECRET` is an unused env var placeholder. This endpoint is not verified against payload spoofing. |
 | Smartlead webhook-registration endpoint + payload shape | `lib/sources/smartlead-api.ts` `registerSmartleadWebhook` | Best-guess path under the confirmed `server.smartlead.ai/api/v1` base. Path itself unconfirmed. |
-| Smartlead lead-categories endpoint | `lib/sources/smartlead-api.ts` `listLeadCategories` | Same — confirmed base URL/auth style (`?api_key=` query param, **not** a bearer token — this was a real correction made during this build, see below), unconfirmed path. Fails soft to default suggestions in the wizard. |
+| ~~Smartlead lead-categories endpoint~~ | `lib/sources/smartlead-api.ts` `listLeadCategories` | **CONFIRMED LIVE 25 Aug 2026** against a real Lotus Labs account: `GET /leads/fetch-categories?api_key=...` returns `[{id, name, sentiment_type}]`. Real category names differ from the brief's assumed defaults — Smartlead's own default set is `Interested`, `Meeting Request` (not "Meeting Booked"), `Not Interested`, `Do Not Contact`, `Information Request`, `Out Of Office`, `Wrong Person`, plus per-workspace custom categories like `Uncategorizable by Ai`/`Sender Originated Bounce`/`Nurturing`. `DEFAULT_STATUS_MAP` in `lib/types.ts` still says "Meeting Booked" — harmless because the wizard always overwrites it with a client's live categories (step 8), but worth fixing the constant itself so nobody copies it verbatim into a real client's statusMap. |
 | HubSpot rate limits | `lib/adapters/hubspot.ts` | Not checked live. Implemented: serial requests, single 429 retry with a 1s delay, no backoff system (by design — full backoff is out of scope). |
 
 **What WAS confirmed live** (via HubSpot's/Smartlead's public docs and, for HubSpot, an actual

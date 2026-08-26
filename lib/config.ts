@@ -100,7 +100,17 @@ export async function setSessionOverride(config: ClientConfig): Promise<void> {
 
 async function applySessionOverrides(clients: ClientConfig[]): Promise<ClientConfig[]> {
   const overrides = await readOverrides();
-  return clients.map((c) => overrides[c.clientId] ?? c);
+  const overridden = clients.map((c) => overrides[c.clientId] ?? c);
+  // A session override for a clientId not already in the base list (e.g. a
+  // real Airtable client whose Status isn't "Active" yet, being exercised
+  // for a supervised test run) previously vanished silently — `.map` only
+  // ever replaces existing entries, never adds new ones. Appending any
+  // override that didn't match makes the override usable on its own, which
+  // is the whole point of this being a testing-only mechanism in the first
+  // place.
+  const knownIds = new Set(clients.map((c) => c.clientId));
+  const extraOverrides = Object.values(overrides).filter((c) => !knownIds.has(c.clientId));
+  return [...overridden, ...extraOverrides];
 }
 
 export async function listClientConfigs(): Promise<ClientConfig[]> {

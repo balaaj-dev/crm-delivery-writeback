@@ -105,13 +105,31 @@ async function fetchAllClientRecords(): Promise<AirtableRecord[]> {
   return records;
 }
 
-function activeStatusFilter(record: AirtableRecord): boolean {
-  const status = record.fields[EXISTING_FIELDS.status];
-  if (typeof status === 'string') return status.toLowerCase() === 'active';
-  if (status && typeof status === 'object' && 'name' in status) {
-    return String((status as { name: unknown }).name).toLowerCase() === 'active';
+/**
+ * Live Status options on the base carry an emoji prefix (confirmed 25 Aug
+ * 2026 — real values are '✅ Active', '❌ Inactive', '🔄 Churning', '🌙
+ * Paused', '⛵️Other'), so an exact `=== 'active'` match silently filtered
+ * out every client, including genuinely active ones — GET /api/clients
+ * returned an empty list with CONFIG_SOURCE=airtable even with a valid
+ * token. Strips everything but letters/spaces before comparing (rather than
+ * a plain `.includes('active')`) because 'Inactive' also contains the
+ * substring "active" and must NOT match.
+ */
+function normalizeStatusLabel(raw: unknown): string {
+  if (typeof raw === 'string') {
+    return raw
+      .replace(/[^\p{L}\s]/gu, '')
+      .trim()
+      .toLowerCase();
   }
-  return false;
+  if (raw && typeof raw === 'object' && 'name' in raw) {
+    return normalizeStatusLabel((raw as { name: unknown }).name);
+  }
+  return '';
+}
+
+function activeStatusFilter(record: AirtableRecord): boolean {
+  return normalizeStatusLabel(record.fields[EXISTING_FIELDS.status]) === 'active';
 }
 
 function safeParseJson<T>(value: unknown, schema: z.ZodType<T>, fallback: T): T {

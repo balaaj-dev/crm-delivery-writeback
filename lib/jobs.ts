@@ -28,7 +28,12 @@ import { readFile, writeFile, mkdir, readdir } from 'node:fs/promises';
 import path from 'node:path';
 import { randomBytes } from 'node:crypto';
 import type { ClientConfig, CrmAdapter } from './types';
-import { listCampaignLeads, listLeadMessageHistory, type SmartleadLead } from './sources/smartlead-api';
+import {
+  listCampaignLeads,
+  listLeadMessageHistory,
+  resolveInterestCategoryIds,
+  type SmartleadLead,
+} from './sources/smartlead-api';
 import { logger, recordEvent } from './log';
 import { isDryRun } from './adapters/index';
 
@@ -52,6 +57,8 @@ export interface DeliveryJob {
   created: number;
   alreadyExisted: number;
   activitiesLogged: number;
+  /** Partial mode only — leads fetched but not delivered because their live Smartlead category isn't Interested/Meeting Booked. */
+  skippedNotInterested: number;
   errors: Array<{ email: string; reason: string }>;
   createdAt: string;
   updatedAt: string;
@@ -170,6 +177,7 @@ export async function startDeliveryJob(
     created: 0,
     alreadyExisted: 0,
     activitiesLogged: 0,
+    skippedNotInterested: 0,
     errors: [],
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
@@ -211,17 +219,37 @@ async function runJob(jobId: string, cfg: ClientConfig, adapter: CrmAdapter): Pr
   await saveJob(job);
   const dryRun = isDryRun();
 
+  // Same partial-mode interest filter as lib/delivery.ts — see that file's
+  // comment for the real incident (25 Aug 2026) this fixes. Resolved once
+  // per job rather than per lead.
+  let interestCategoryIds: Set<number> | null = null;
+  if (cfg.mode === 'partial') {
+    try {
+      interestCategoryIds = await resolveInterestCategoryIds(cfg.source.apiKey, cfg.statusMap);
+    } catch (err) {
+      job.status = 'failed';
+      job.failureReason = `Partial-mode delivery needs Smartlead's lead categories to filter for Interested/Meeting Booked leads, and that lookup failed: ${err instanceof Error ? err.message : String(err)}`;
+      job.finishedAt = new Date().toISOString();
+      await saveJob(job);
+      return;
+    }
+  }
+
   try {
+    // targetLeads counts leads actually delivered, not leads scanned — in
+    // partial mode those diverge (most campaign leads have no category yet
+    // and get filtered out), so pagination keeps advancing on job.offset
+    // regardless, bounded only by the campaign actually running out.
     while (job.processed < job.targetLeads) {
-      const pageSize = Math.min(PAGE_SIZE, job.targetLeads - job.processed);
-      const page = await listCampaignLeads(cfg.source.apiKey, job.campaignId, pageSize, job.offset);
+      const page = await listCampaignLeads(cfg.source.apiKey, job.campaignId, PAGE_SIZE, job.offset);
       job.totalLeadsInCampaign = page.totalLeads;
 
       if (page.leads.length === 0) break; // exhausted the campaign before hitting targetLeads
 
       for (const lead of page.leads) {
-        job.processed += 1;
+        if (job.processed >= job.targetLeads) break; // reached target mid-page
         job.offset += 1;
+
         const baseLog = {
           timestamp: new Date().toISOString(),
           clientId: cfg.clientId,
@@ -230,6 +258,15 @@ async function runJob(jobId: string, cfg: ClientConfig, adapter: CrmAdapter): Pr
           eventId: `delivery-job:${jobId}:${lead.email}`,
           dryRun,
         };
+
+        if (interestCategoryIds && !(lead.leadCategoryId != null && interestCategoryIds.has(lead.leadCategoryId))) {
+          job.skippedNotInterested += 1;
+          await recordEvent({ ...baseLog, outcome: 'skip', reason: 'not_interested_category' });
+          await saveJob(job);
+          continue;
+        }
+
+        job.processed += 1;
 
         try {
           let ref = await adapter.findRecord(lead.email, cfg);

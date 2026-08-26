@@ -222,7 +222,12 @@ export const DEFAULT_FIELD_MAP: FieldMapping[] = [
 
 export const DEFAULT_STATUS_MAP: Record<string, string> = {
   Interested: 'positive_reply',
-  'Meeting Booked': 'meeting_booked',
+  // Smartlead's own default category is named "Meeting Request", not
+  // "Meeting Booked" — confirmed live, 25 Aug 2026, against a real
+  // workspace's GET /leads/fetch-categories. Always overwritten by the
+  // wizard's live category fetch anyway (step 8) — this is only the
+  // fallback shown before that fetch runs.
+  'Meeting Request': 'meeting_booked',
   'Not Interested': 'closed_lost',
   'Not Now': 'nurture',
   'Wrong Person': 'referral',
