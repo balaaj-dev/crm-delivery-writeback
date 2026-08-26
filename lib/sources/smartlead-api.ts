@@ -52,7 +52,7 @@ const SMARTLEAD_API_BASE = 'https://server.smartlead.ai/api/v1';
  * instead of a per-request one.
  */
 async function smartleadFetch(url: URL, attempt = 1): Promise<Response> {
-  const res = await smartleadFetch(url);
+  const res = await fetch(url);
   if (res.status === 429 && attempt <= 3) {
     const delayMs = attempt * 3000;
     logger.warn('smartlead: rate limited, retrying with backoff', { attempt, delayMs, path: url.pathname });
