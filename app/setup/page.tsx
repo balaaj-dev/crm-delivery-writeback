@@ -703,13 +703,24 @@ export default function SetupWizard() {
               </div>
             </div>
 
+            {campaignsWarning && (
+              <div className="flex items-center justify-between gap-3 rounded-lg bg-amber-50 p-3 text-sm text-amber-800 ring-1 ring-inset ring-amber-200">
+                <p>
+                  Couldn&apos;t load this client&apos;s Smartlead campaigns ({campaignsWarning}) — this
+                  also means step 9 (Deliver contacts) won&apos;t have anything to deliver from until
+                  this is retried.
+                </p>
+                <button
+                  onClick={loadCampaigns}
+                  className="flex-none rounded-lg border border-amber-300 bg-white px-3 py-1 text-xs font-semibold text-amber-800 transition hover:bg-amber-100"
+                >
+                  Retry
+                </button>
+              </div>
+            )}
+
             {syncScope === 'specific_campaigns' && (
               <div>
-                {campaignsWarning && (
-                  <p className="mb-3 rounded-lg bg-amber-50 p-3 text-sm text-amber-800 ring-1 ring-inset ring-amber-200">
-                    {campaignsWarning}
-                  </p>
-                )}
                 {campaigns.length === 0 ? (
                   <p className="rounded-lg border border-dashed border-slate-300 p-4 text-sm text-slate-500">
                     No campaigns found for this client&apos;s Smartlead account yet.
