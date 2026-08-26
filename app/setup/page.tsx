@@ -50,6 +50,7 @@ interface DeliveryJobView {
   alreadyExisted: number;
   activitiesLogged: number;
   skippedNotInterested: number;
+  dealsCreated: number;
   totalLeadsInCampaign?: number;
   errors: Array<{ email: string; reason: string }>;
   failureReason?: string;
@@ -1135,8 +1136,8 @@ export default function SetupWizard() {
                             </span>
                           </p>
                           <p className="mt-1 text-slate-600">
-                            {j.created} created · {j.alreadyExisted} already existed ·{' '}
-                            {j.skippedNotInterested} skipped (not interested) · {j.activitiesLogged}{' '}
+                            {j.created} created · {j.dealsCreated} deals created · {j.alreadyExisted} already
+                            existed · {j.skippedNotInterested} skipped (not interested) · {j.activitiesLogged}{' '}
                             activities logged · {j.errors.length} errors
                             {j.totalLeadsInCampaign ? ` · ${j.totalLeadsInCampaign} leads in campaign` : ''}
                           </p>

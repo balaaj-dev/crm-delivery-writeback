@@ -59,6 +59,8 @@ export interface DeliveryJob {
   activitiesLogged: number;
   /** Partial mode only — leads fetched but not delivered because their live Smartlead category isn't Interested/Meeting Booked. */
   skippedNotInterested: number;
+  /** Deals created for genuinely interested leads — see the comment above the deal-creation block in runJob for why delivery didn't do this before 26 Aug 2026. */
+  dealsCreated: number;
   errors: Array<{ email: string; reason: string }>;
   createdAt: string;
   updatedAt: string;
@@ -151,7 +153,15 @@ function messageToSyntheticEvent(
     clientId,
     source: 'smartlead' as const,
     campaign: { id: '', name: '' },
-    prospect: { email: lead.email.trim().toLowerCase() },
+    // Name included (not just email) — see lib/delivery.ts's identical
+    // helper for why: without it, HubSpot's writeActivity from/to
+    // participant fields show only an address, and the reply side shows
+    // "Unknown Contact" for the name portion.
+    prospect: {
+      email: lead.email.trim().toLowerCase(),
+      firstName: lead.firstName,
+      lastName: lead.lastName,
+    },
     detail: { subject: message.subject, bodyPreview: message.body.slice(0, 2000) },
     raw: message,
   };
@@ -180,6 +190,7 @@ export async function startDeliveryJob(
     alreadyExisted: 0,
     activitiesLogged: 0,
     skippedNotInterested: 0,
+    dealsCreated: 0,
     errors: [],
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
@@ -222,18 +233,33 @@ async function runJob(jobId: string, cfg: ClientConfig, adapter: CrmAdapter): Pr
   const dryRun = isDryRun();
 
   // Same partial-mode interest filter as lib/delivery.ts — see that file's
-  // comment for the real incident (25 Aug 2026) this fixes. Resolved once
-  // per job rather than per lead.
+  // comment for the real incident (25 Aug 2026) this fixes. Also resolved
+  // in full mode when createDeal is on, since it's now what decides
+  // whether a delivered lead gets a deal too (see below) — full mode
+  // delivers every lead as a contact, but a deal should still only be
+  // created for the ones genuinely marked Interested/Meeting Booked, same
+  // distinction lib/dispatch.ts's own isDealSignal makes for live replies.
+  // Resolved once per job rather than per lead.
   let interestCategoryIds: Set<number> | null = null;
-  if (cfg.mode === 'partial') {
+  if (cfg.mode === 'partial' || cfg.behaviour.createDeal) {
     try {
       interestCategoryIds = await resolveInterestCategoryIds(cfg.source.apiKey, cfg.statusMap);
     } catch (err) {
-      job.status = 'failed';
-      job.failureReason = `Partial-mode delivery needs Smartlead's lead categories to filter for Interested/Meeting Booked leads, and that lookup failed: ${err instanceof Error ? err.message : String(err)}`;
-      job.finishedAt = new Date().toISOString();
-      await saveJob(job);
-      return;
+      if (cfg.mode === 'partial') {
+        // Fail safe, not fail open — see lib/delivery.ts's comment.
+        job.status = 'failed';
+        job.failureReason = `Partial-mode delivery needs Smartlead's lead categories to filter for Interested/Meeting Booked leads, and that lookup failed: ${err instanceof Error ? err.message : String(err)}`;
+        job.finishedAt = new Date().toISOString();
+        await saveJob(job);
+        return;
+      }
+      // Full mode doesn't depend on this for delivery itself — degrade
+      // gracefully by skipping deal creation this run rather than failing
+      // the whole job over a feature that isn't its main job.
+      logger.warn('delivery job: could not resolve interest categories — deal creation will be skipped this run', {
+        jobId,
+        error: err instanceof Error ? err.message : String(err),
+      });
     }
   }
 
@@ -261,7 +287,15 @@ async function runJob(jobId: string, cfg: ClientConfig, adapter: CrmAdapter): Pr
           dryRun,
         };
 
-        if (interestCategoryIds && !(lead.leadCategoryId != null && interestCategoryIds.has(lead.leadCategoryId))) {
+        // interestCategoryIds is now resolved in full mode too (when
+        // createDeal is on, for the deal-creation check below) — so this
+        // filter must stay gated on cfg.mode itself, not just on whether
+        // the set exists, or full mode would wrongly start skipping leads
+        // it's supposed to deliver unconditionally.
+        const isInterested =
+          interestCategoryIds != null && lead.leadCategoryId != null && interestCategoryIds.has(lead.leadCategoryId);
+
+        if (cfg.mode === 'partial' && !isInterested) {
           job.skippedNotInterested += 1;
           await recordEvent({ ...baseLog, outcome: 'skip', reason: 'not_interested_category' });
           await saveJob(job);
@@ -272,11 +306,13 @@ async function runJob(jobId: string, cfg: ClientConfig, adapter: CrmAdapter): Pr
 
         try {
           let ref = await adapter.findRecord(lead.email, cfg);
+          let isNewRecord = false;
           if (ref) {
             job.alreadyExisted += 1;
           } else {
             ref = await adapter.createRecord(leadToSyntheticEvent(lead, cfg.clientId), cfg);
             job.created += 1;
+            isNewRecord = true;
           }
 
           const statusValue = deliveryStatusValue(lead);
@@ -306,6 +342,28 @@ async function runJob(jobId: string, cfg: ClientConfig, adapter: CrmAdapter): Pr
               email: lead.email,
               error: err instanceof Error ? err.message : String(err),
             });
+          }
+
+          // Deal creation — the gap found live, 26 Aug 2026: delivery
+          // (this file) never went through lib/dispatch.ts, so it never
+          // did what a real webhook-triggered positive_reply/meeting_booked
+          // does — create a deal. Mirrors dispatch.ts's own isDealSignal
+          // check (same interest test as the partial-mode filter above,
+          // just also evaluated in full mode now), gated to a record this
+          // pass actually created — an already-existing contact isn't
+          // re-given a deal on every subsequent delivery run, since this
+          // file has no durable per-ref dedup the way dispatch.ts does.
+          if (isNewRecord && isInterested && cfg.behaviour.createDeal && adapter.createDeal) {
+            try {
+              await adapter.createDeal(ref, leadToSyntheticEvent(lead, cfg.clientId), cfg);
+              job.dealsCreated += 1;
+            } catch (err) {
+              logger.warn('delivery job: deal creation failed', {
+                jobId,
+                email: lead.email,
+                error: err instanceof Error ? err.message : String(err),
+              });
+            }
           }
 
           await recordEvent({

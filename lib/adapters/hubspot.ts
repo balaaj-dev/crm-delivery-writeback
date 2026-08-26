@@ -327,15 +327,39 @@ export const hubspotAdapter: CrmAdapter = {
     // own hs_engagements_last_contacted populate correctly — no separate
     // "last contacted" field for this adapter to set by hand.
     if (event.type === 'email_sent' || event.type === 'reply') {
+      const isReply = event.type === 'reply';
+      // Real "from"/"to" participant fields — found live, 26 Aug 2026: a
+      // real prospect's reply showed up in HubSpot correctly associated
+      // with their contact (it appeared on the right timeline), but the
+      // engagement itself displayed "Incoming email ... from Unknown
+      // Contact to Unknown Contact" — the association is what puts an
+      // engagement on a contact's timeline at all, but HubSpot's own UI
+      // resolves the "from"/"to" *display* separately, from these
+      // participant properties, which were never being set. Confirmed
+      // live: hs_email_from_email/hs_email_from_firstname/
+      // hs_email_from_lastname/hs_email_to_email are real, accepted
+      // properties (verified via a direct create call and reading the
+      // response back).
+      const participantFields: Record<string, string> = isReply
+        ? { hs_email_from_email: event.prospect.email }
+        : { hs_email_to_email: event.prospect.email };
+      if (event.prospect.firstName) {
+        participantFields[isReply ? 'hs_email_from_firstname' : 'hs_email_to_firstname'] = event.prospect.firstName;
+      }
+      if (event.prospect.lastName) {
+        participantFields[isReply ? 'hs_email_from_lastname' : 'hs_email_to_lastname'] = event.prospect.lastName;
+      }
+
       const createRes = await hubspotFetch(cfg, '/crm/v3/objects/emails', {
         method: 'POST',
         body: JSON.stringify({
           properties: {
             hs_timestamp: event.occurredAt,
-            hs_email_direction: event.type === 'reply' ? 'INCOMING_EMAIL' : 'EMAIL',
+            hs_email_direction: isReply ? 'INCOMING_EMAIL' : 'EMAIL',
             hs_email_status: 'SENT',
             hs_email_subject: event.detail.subject ?? '(no subject)',
             hs_email_text: event.detail.bodyPreview ?? '',
+            ...participantFields,
           },
         }),
       });

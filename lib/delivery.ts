@@ -52,6 +52,8 @@ export interface DeliveryResult {
   cappedAt?: number;
   /** Partial mode only — leads fetched but not delivered because their live Smartlead category isn't Interested/Meeting Booked. */
   skippedNotInterested: number;
+  /** Deals created for genuinely interested leads — see the comment above the deal-creation block below for why delivery didn't do this before 26 Aug 2026. */
+  dealsCreated: number;
 }
 
 function leadToSyntheticEvent(lead: SmartleadLead, clientId: string): CanonicalEvent {
@@ -99,7 +101,16 @@ function messageToSyntheticEvent(
     clientId,
     source: 'smartlead',
     campaign: { id: '', name: '' },
-    prospect: { email: lead.email.trim().toLowerCase() },
+    // Name included (not just email), added 26 Aug 2026 — needed for
+    // writeActivity's from/to participant fields to show a real name
+    // instead of just an address, and for hs_email_from/to_firstname
+    // /lastname on the reply side specifically to resolve away from
+    // "Unknown Contact" in HubSpot's UI.
+    prospect: {
+      email: lead.email.trim().toLowerCase(),
+      firstName: lead.firstName,
+      lastName: lead.lastName,
+    },
     detail: {
       subject: message.subject,
       bodyPreview: message.body.slice(0, 2000),
@@ -153,18 +164,25 @@ export async function deliverCampaignLeads(
   // that a CRM record only gets created on a genuine interest signal — a
   // real incident (25 Aug 2026, Lotus Labs' Tracie Cranford: bounced, never
   // replied, still delivered as a Lead) confirmed delivery wasn't actually
-  // enforcing that. Full mode has no such restriction by design.
+  // enforcing that. Full mode has no such restriction by design. Also
+  // resolved in full mode when createDeal is on — see runJob's identical
+  // comment in lib/jobs.ts, which this mirrors.
   let interestCategoryIds: Set<number> | null = null;
-  if (cfg.mode === 'partial') {
+  if (cfg.mode === 'partial' || cfg.behaviour.createDeal) {
     try {
       interestCategoryIds = await resolveInterestCategoryIds(cfg.source.apiKey, cfg.statusMap);
     } catch (err) {
-      // Fail safe, not fail open — if we can't verify which categories mean
-      // "interested", refuse to deliver rather than risk creating CRM
-      // contacts for leads with no real interest signal.
-      throw new Error(
-        `Partial-mode delivery needs Smartlead's lead categories to filter for Interested/Meeting Booked leads, and that lookup failed: ${err instanceof Error ? err.message : String(err)}`,
-      );
+      if (cfg.mode === 'partial') {
+        // Fail safe, not fail open — if we can't verify which categories
+        // mean "interested", refuse to deliver rather than risk creating
+        // CRM contacts for leads with no real interest signal.
+        throw new Error(
+          `Partial-mode delivery needs Smartlead's lead categories to filter for Interested/Meeting Booked leads, and that lookup failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+      logger.warn('delivery: could not resolve interest categories — deal creation will be skipped this run', {
+        error: err instanceof Error ? err.message : String(err),
+      });
     }
   }
 
@@ -177,6 +195,7 @@ export async function deliverCampaignLeads(
     activitiesLogged: 0,
     errors: [],
     skippedNotInterested: 0,
+    dealsCreated: 0,
   };
   if (totalLeads > leads.length) result.cappedAt = leads.length;
 
@@ -190,7 +209,13 @@ export async function deliverCampaignLeads(
       dryRun,
     };
 
-    if (interestCategoryIds && !(lead.leadCategoryId != null && interestCategoryIds.has(lead.leadCategoryId))) {
+    // See lib/jobs.ts's runJob for why this filter stays gated on
+    // cfg.mode, not just on whether interestCategoryIds exists — it's now
+    // resolved in full mode too, for the deal-creation check below.
+    const isInterested =
+      interestCategoryIds != null && lead.leadCategoryId != null && interestCategoryIds.has(lead.leadCategoryId);
+
+    if (cfg.mode === 'partial' && !isInterested) {
       result.skippedNotInterested += 1;
       await recordEvent({ ...baseLog, outcome: 'skip', reason: 'not_interested_category' });
       continue;
@@ -199,12 +224,14 @@ export async function deliverCampaignLeads(
     result.processed += 1;
     try {
       let ref = await adapter.findRecord(lead.email, cfg);
+      let isNewRecord = false;
       if (ref) {
         result.alreadyExisted += 1;
       } else {
         const event = leadToSyntheticEvent(lead, cfg.clientId);
         ref = await adapter.createRecord(event, cfg);
         result.created += 1;
+        isNewRecord = true;
       }
 
       // Best-effort from here — a failure backfilling status/activity
@@ -235,6 +262,23 @@ export async function deliverCampaignLeads(
           email: lead.email,
           error: err instanceof Error ? err.message : String(err),
         });
+      }
+
+      // Deal creation — the gap found live, 26 Aug 2026: delivery never
+      // went through lib/dispatch.ts, so it never did what a real
+      // webhook-triggered positive_reply/meeting_booked does — create a
+      // deal. Gated to a record this pass actually created, since this
+      // file has no durable per-ref dedup the way dispatch.ts does.
+      if (isNewRecord && isInterested && cfg.behaviour.createDeal && adapter.createDeal) {
+        try {
+          await adapter.createDeal(ref, leadToSyntheticEvent(lead, cfg.clientId), cfg);
+          result.dealsCreated += 1;
+        } catch (err) {
+          logger.warn('delivery: deal creation failed', {
+            email: lead.email,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
       }
 
       await recordEvent({
