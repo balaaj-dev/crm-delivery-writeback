@@ -136,6 +136,74 @@ function NavButtons({
 const inputClass =
   'w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 shadow-sm transition focus:border-cymate-orange focus:outline-none focus:ring-2 focus:ring-cymate-orange/20';
 
+/**
+ * The status-mapping step used to be a bare free-text box (found live,
+ * 26 Aug 2026) — technically fine, since the HubSpot property this writes
+ * to (cymate_writeback_status) is a plain text field with no enum to
+ * enforce. But exactly two of these strings — positive_reply and
+ * meeting_booked — aren't just labels: they're what this app's own
+ * dispatch logic matches on to unlock the "genuinely interested" delivery
+ * filter and deal creation (see lib/dispatch.ts's PROMOTABLE_TYPES). A
+ * typo in either one silently does nothing, with no error anywhere. This
+ * is the fixed set of values that actually mean something to the app;
+ * anything else is a real custom label, which stays free text.
+ */
+const STATUS_VALUE_OPTIONS = [
+  { value: 'positive_reply', label: 'positive_reply — unlocks delivery + deal creation' },
+  { value: 'meeting_booked', label: 'meeting_booked — unlocks delivery + deal creation' },
+  { value: 'closed_lost', label: 'closed_lost' },
+  { value: 'nurture', label: 'nurture' },
+  { value: 'referral', label: 'referral' },
+  { value: 'ignore', label: 'ignore' },
+  { value: 'unsubscribed', label: 'unsubscribed' },
+];
+const CUSTOM_STATUS_VALUE = '__custom__';
+
+function StatusValueField({
+  value,
+  onChange,
+}: {
+  value: string;
+  onChange: (v: string) => void;
+}) {
+  const known = STATUS_VALUE_OPTIONS.some((o) => o.value === value);
+  const [customMode, setCustomMode] = useState(value !== '' && !known);
+
+  return (
+    <div className="flex-1 space-y-1.5">
+      <select
+        className={inputClass}
+        value={customMode ? CUSTOM_STATUS_VALUE : value}
+        onChange={(e) => {
+          if (e.target.value === CUSTOM_STATUS_VALUE) {
+            setCustomMode(true);
+            onChange('');
+          } else {
+            setCustomMode(false);
+            onChange(e.target.value);
+          }
+        }}
+      >
+        <option value="">Select a status value…</option>
+        {STATUS_VALUE_OPTIONS.map((o) => (
+          <option key={o.value} value={o.value}>
+            {o.label}
+          </option>
+        ))}
+        <option value={CUSTOM_STATUS_VALUE}>Custom…</option>
+      </select>
+      {customMode && (
+        <input
+          className={inputClass}
+          value={value}
+          placeholder="Custom status value"
+          onChange={(e) => onChange(e.target.value)}
+        />
+      )}
+    </div>
+  );
+}
+
 export default function SetupWizard() {
   const [step, setStep] = useState(1);
   const [clients, setClients] = useState<ClientConfig[]>([]);
@@ -956,10 +1024,9 @@ export default function SetupWizard() {
               {Object.keys(statusMap).map((category) => (
                 <div key={category} className="flex items-center gap-3">
                   <span className="w-44 flex-none text-sm text-slate-700">{category}</span>
-                  <input
-                    className={inputClass}
-                    value={statusMap[category]}
-                    onChange={(e) => setStatusMap({ ...statusMap, [category]: e.target.value })}
+                  <StatusValueField
+                    value={statusMap[category] ?? ''}
+                    onChange={(v) => setStatusMap({ ...statusMap, [category]: v })}
                   />
                 </div>
               ))}
@@ -968,10 +1035,9 @@ export default function SetupWizard() {
                 .map((c) => (
                   <div key={c.name} className="flex items-center gap-3">
                     <span className="w-44 flex-none text-sm text-slate-700">{c.name}</span>
-                    <input
-                      className={inputClass}
-                      placeholder="e.g. nurture"
-                      onChange={(e) => setStatusMap({ ...statusMap, [c.name]: e.target.value })}
+                    <StatusValueField
+                      value={statusMap[c.name] ?? ''}
+                      onChange={(v) => setStatusMap({ ...statusMap, [c.name]: v })}
                     />
                   </div>
                 ))}
