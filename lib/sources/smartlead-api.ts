@@ -248,11 +248,17 @@ export async function resolveInterestCategoryIds(
 }
 
 /**
- * [VERIFY] path and payload shape not confirmed — see file header.
  * Registers exactly the 7 approved events (brief §6) for one campaign.
  * Never pass EMAIL_OPEN or EMAIL_LINK_CLICK here — see brief §2.3 and
  * lib/sources/smartlead.ts's FORBIDDEN_EVENT_TYPES guard, which this call
  * cannot bypass even if asked to.
+ *
+ * Path/method CONFIRMED live, 26 Aug 2026 (real Lotus Labs account,
+ * real wizard run): every attempt failed with a 400 whose body was
+ * `{"message":"\"name\" is required","validation":{"source":"body","keys":["name"]}}`
+ * — a genuine, previously-unconfirmed requirement, not a guess. `name`
+ * added below; still worth a supervised re-test to confirm 200s land
+ * before relying on this for a real client's live sync.
  */
 export async function registerSmartleadWebhook(
   apiKey: string,
@@ -266,6 +272,7 @@ export async function registerSmartleadWebhook(
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
+      name: 'Cymate CRM Writeback',
       // Never EMAIL_OPEN / EMAIL_LINK_CLICK — see brief §2.3.
       event_types: SMARTLEAD_EVENT_TYPES,
       webhook_url: targetUrl,
