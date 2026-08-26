@@ -32,6 +32,7 @@ export const clientConfigSchema = z.object({
     apiKey: z.string().min(1),
     smartleadClientId: z.string().optional(),
     campaignIds: z.array(z.string()).optional(),
+    webhookSecret: z.string().optional(),
   }),
 
   crm: z.object({
@@ -46,6 +47,16 @@ export const clientConfigSchema = z.object({
     createDeal: z.boolean(),
     dealStageOnCreate: z.string().optional(),
     planLimitAcknowledged: z.boolean(),
+    // Optional at the schema level so existing/pre-owner-guardrail configs
+    // still parse — actually *requiring* it for a config that's allowed to
+    // create real records is enforced explicitly in
+    // app/api/clients/[id]/config/route.ts, not here. This field was
+    // missing from this schema entirely until 26 Aug 2026, which meant
+    // z.object()'s default "strip unknown keys" behavior silently deleted
+    // it from every saved config — confirmed live: a real deal got created
+    // with no owner despite the wizard requiring a pick before "Next"
+    // worked, because the value never survived this parse.
+    ownerId: z.string().optional(),
   }),
 
   events: z.record(canonicalEventTypeSchema, z.boolean()),

@@ -219,6 +219,19 @@ async function ensureCymateStatusProperty(cfg: ClientConfig): Promise<void> {
   }
 }
 
+/**
+ * Real lead details in the deal name, not a bare record id — found live,
+ * 26 Aug 2026: a deal titled "Cymate writeback — 540713893599" tells a CSM
+ * scanning their deals list nothing about who it's for. Falls back to the
+ * old id-based name only when no prospect name/company/email survived.
+ */
+function dealNameFor(event: CanonicalEvent, ref: { id: string }): string {
+  const name = [event.prospect.firstName, event.prospect.lastName].filter(Boolean).join(' ');
+  const who = name || event.prospect.email || undefined;
+  const label = [who, event.prospect.company].filter(Boolean).join(' — ');
+  return label || `Cymate writeback — ${ref.id}`;
+}
+
 function buildContactProperties(event: CanonicalEvent, cfg: ClientConfig): Record<string, string> {
   const properties: Record<string, string> = {};
   for (const mapping of cfg.fieldMap) {
@@ -400,7 +413,7 @@ export const hubspotAdapter: CrmAdapter = {
     }
   },
 
-  async createDeal(ref, _event, cfg) {
+  async createDeal(ref, event, cfg) {
     // HubSpot silently drops `dealstage` unless `pipeline` is sent alongside
     // it (confirmed live, 25 Aug 2026 — no error, the value just comes back
     // null). Resolve which pipeline the configured stage actually belongs
@@ -426,7 +439,7 @@ export const hubspotAdapter: CrmAdapter = {
       method: 'POST',
       body: JSON.stringify({
         properties: {
-          dealname: `Cymate writeback — ${ref.id}`,
+          dealname: dealNameFor(event, ref),
           ...stageProperties,
           // Required owner (Jairo's 26 Aug 2026 feedback) — deal owner in
           // this case, same property name HubSpot uses for contact owner.

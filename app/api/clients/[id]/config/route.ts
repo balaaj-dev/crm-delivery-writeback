@@ -57,6 +57,25 @@ export async function PUT(req: Request, { params }: { params: { id: string } }) 
     );
   }
 
+  // Server-side owner guardrail (Jairo's 26 Aug 2026 feedback: "not just
+  // defaulting to whoever's logged in"). The wizard already disables its
+  // own "Next"/"Build" buttons without an owner picked, but a disabled
+  // button is a UX nicety, not a real boundary — this is the actual
+  // enforcement. Only applies once a config is `activated`, since that's
+  // the same flag dispatch.ts's own "not_activated" check treats as "this
+  // config is allowed to create real records" — an inactive/draft config
+  // being saved without an owner yet is fine.
+  if (config.activated && !config.behaviour.ownerId) {
+    return NextResponse.json(
+      {
+        error:
+          'Refusing to activate this config without an owner set (behaviour.ownerId) — records ' +
+          "would otherwise be created with no owner. Pick one in the wizard's field-mapping step.",
+      },
+      { status: 400 },
+    );
+  }
+
   await setSessionOverride(config);
 
   let persisted = false;
