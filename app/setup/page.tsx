@@ -108,12 +108,15 @@ function NavButtons({
   backDisabled,
   nextDisabled,
   nextLabel = 'Next',
+  hideNext,
 }: {
   onBack: () => void;
-  onNext: () => void;
+  onNext?: () => void;
   backDisabled?: boolean;
   nextDisabled?: boolean;
   nextLabel?: string;
+  /** Step 11 has nothing after it — a disabled button that can never be clicked is just confusing, so omit it entirely instead of greying it out. */
+  hideNext?: boolean;
 }) {
   return (
     <div className="mt-8 flex justify-between border-t border-slate-100 pt-6">
@@ -124,13 +127,15 @@ function NavButtons({
       >
         ← Back
       </button>
-      <button
-        onClick={onNext}
-        disabled={nextDisabled}
-        className="rounded-lg bg-cymate-orange px-5 py-2 text-sm font-semibold text-white shadow-sm transition hover:bg-cymate-orange-dark disabled:cursor-not-allowed disabled:opacity-30"
-      >
-        {nextLabel}
-      </button>
+      {!hideNext && (
+        <button
+          onClick={onNext}
+          disabled={nextDisabled}
+          className="rounded-lg bg-cymate-orange px-5 py-2 text-sm font-semibold text-white shadow-sm transition hover:bg-cymate-orange-dark disabled:cursor-not-allowed disabled:opacity-30"
+        >
+          {nextLabel}
+        </button>
+      )}
     </div>
   );
 }
@@ -1323,7 +1328,7 @@ export default function SetupWizard() {
               </a>{' '}
               to confirm the test event landed correctly.
             </p>
-            <NavButtons onBack={() => setStep(10)} onNext={() => {}} nextDisabled />
+            <NavButtons onBack={() => setStep(10)} hideNext />
           </section>
         )}
       </div>
