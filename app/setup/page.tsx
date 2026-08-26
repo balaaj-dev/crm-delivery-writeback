@@ -33,8 +33,8 @@ const STEP_TITLES = [
   'CRM branch',
   'CRM credentials',
   'Field mapping',
-  'Deliver contacts',
   'Status mapping',
+  'Deliver contacts',
   'Record behaviour',
   'Review and build',
 ];
@@ -317,6 +317,55 @@ export default function SetupWizard() {
     return campaigns.filter((c) => c.status === 'ACTIVE').map((c) => c.id);
   }
 
+  /**
+   * The client config as the wizard currently understands it — shared by
+   * startDelivery (an interim, not-yet-activated save) and runBuild (the
+   * final, activated one). Extracted 26 Aug 2026 after a real bug: Deliver
+   * contacts (this step) used to run against whatever was already durably
+   * saved for this client, which for any client being configured for the
+   * first time is empty — so partial-mode delivery's category filter had
+   * no statusMap to check against and treated every lead as "not
+   * interested." Saving this first means delivery actually sees the
+   * mapping just chosen in the previous step, not stale/empty data.
+   */
+  function buildConfig(activated: boolean): ClientConfig {
+    return {
+      clientId: selectedClientId,
+      clientName: selectedClient?.clientName ?? selectedClientId,
+      activated,
+      mode,
+      source: {
+        ...(selectedClient?.source ?? { platform: 'smartlead', apiKey: '' }),
+        campaignIds: selectedCampaignIds,
+      },
+      crm: {
+        type: crmType,
+        integrationPath: crmType === 'salesforce' ? 'outboundsync' : 'native',
+        credentials,
+      },
+      behaviour: {
+        createRecordOnInterestedReply,
+        createRecordForAllLeads,
+        createDeal,
+        dealStageOnCreate: dealStageOnCreate || undefined,
+        planLimitAcknowledged,
+        ownerId: ownerId || undefined,
+      },
+      events: {
+        email_sent: syncScope === 'all_contacts' || syncScope === 'specific_campaigns',
+        reply: true,
+        positive_reply: true,
+        bounce: true,
+        unsubscribe: true,
+        status_change: true,
+        meeting_booked: true,
+      },
+      fieldMap,
+      statusMap,
+      notifications: selectedClient?.notifications ?? {},
+    };
+  }
+
   async function pollDeliveryJobs(jobIds: string[]) {
     pollingRef.current = true;
     while (pollingRef.current) {
@@ -345,6 +394,22 @@ export default function SetupWizard() {
     setDelivering(true);
     setDeliveryJobs([]);
     try {
+      // Interim save (not yet activated) so /api/delivery/jobs reads the
+      // statusMap/fieldMap/credentials actually chosen in this wizard run
+      // instead of whatever was previously saved for this client — see
+      // buildConfig's comment for the real bug this fixes.
+      const stageRes = await fetch(`/api/clients/${selectedClientId}/config`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(buildConfig(false)),
+      });
+      if (!stageRes.ok) {
+        const stageData = await stageRes.json().catch(() => ({}));
+        setDeliveryError(stageData.error ?? 'Could not save the current setup before delivering.');
+        setDelivering(false);
+        return;
+      }
+
       const started = await Promise.all(
         targetCampaignIds.map((campaignId) =>
           fetch('/api/delivery/jobs', {
@@ -377,41 +442,7 @@ export default function SetupWizard() {
     setBuilding(true);
     setBuildResult(null);
     try {
-      const finalConfig: ClientConfig = {
-        clientId: selectedClientId,
-        clientName: selectedClient?.clientName ?? selectedClientId,
-        activated: true,
-        mode,
-        source: {
-          ...(selectedClient?.source ?? { platform: 'smartlead', apiKey: '' }),
-          campaignIds: selectedCampaignIds,
-        },
-        crm: {
-          type: crmType,
-          integrationPath: crmType === 'salesforce' ? 'outboundsync' : 'native',
-          credentials,
-        },
-        behaviour: {
-          createRecordOnInterestedReply,
-          createRecordForAllLeads,
-          createDeal,
-          dealStageOnCreate: dealStageOnCreate || undefined,
-          planLimitAcknowledged,
-          ownerId: ownerId || undefined,
-        },
-        events: {
-          email_sent: syncScope === 'all_contacts' || syncScope === 'specific_campaigns',
-          reply: true,
-          positive_reply: true,
-          bounce: true,
-          unsubscribe: true,
-          status_change: true,
-          meeting_booked: true,
-        },
-        fieldMap,
-        statusMap,
-        notifications: selectedClient?.notifications ?? {},
-      };
+      const finalConfig = buildConfig(true);
 
       // Awaited (not fire-and-forget) — this must complete before the test
       // event fires below, since it's what makes the test event (and any
@@ -895,11 +926,61 @@ export default function SetupWizard() {
               </select>
             </div>
 
-            <NavButtons onBack={() => setStep(6)} onNext={() => setStep(8)} nextDisabled={ownerGuardrailBlocked} />
+            <NavButtons
+              onBack={() => setStep(6)}
+              onNext={() => {
+                loadCategories();
+                setStep(8);
+              }}
+              nextDisabled={ownerGuardrailBlocked}
+            />
           </section>
         )}
 
         {step === 8 && (
+          <section>
+            {categoriesWarning && (
+              <p className="mb-4 rounded-lg bg-amber-50 p-3 text-sm text-amber-800 ring-1 ring-inset ring-amber-200">
+                {categoriesWarning}
+              </p>
+            )}
+            <p className="mb-4 text-sm text-slate-600">
+              Map each Smartlead lead category to a status value written into the CRM. Categories
+              whose value is <code className="rounded bg-slate-100 px-1 py-0.5">positive_reply</code> or{' '}
+              <code className="rounded bg-slate-100 px-1 py-0.5">meeting_booked</code> also unlock
+              those event types for dispatch — and this decides which leads the next step
+              (Deliver contacts) treats as worth creating a record for, in partial mode. That
+              dependency is exactly why this step comes before Deliver, not after.
+            </p>
+            <div className="space-y-2">
+              {Object.keys(statusMap).map((category) => (
+                <div key={category} className="flex items-center gap-3">
+                  <span className="w-44 flex-none text-sm text-slate-700">{category}</span>
+                  <input
+                    className={inputClass}
+                    value={statusMap[category]}
+                    onChange={(e) => setStatusMap({ ...statusMap, [category]: e.target.value })}
+                  />
+                </div>
+              ))}
+              {categories
+                .filter((c) => !(c.name in statusMap))
+                .map((c) => (
+                  <div key={c.name} className="flex items-center gap-3">
+                    <span className="w-44 flex-none text-sm text-slate-700">{c.name}</span>
+                    <input
+                      className={inputClass}
+                      placeholder="e.g. nurture"
+                      onChange={(e) => setStatusMap({ ...statusMap, [c.name]: e.target.value })}
+                    />
+                  </div>
+                ))}
+            </div>
+            <NavButtons onBack={() => setStep(7)} onNext={() => setStep(9)} />
+          </section>
+        )}
+
+        {step === 9 && (
           <section>
             <p className="mb-4 text-sm text-slate-600">
               The other half of S1 — bulk-creates CRM records for leads that already exist in
@@ -975,53 +1056,6 @@ export default function SetupWizard() {
                 </>
               );
             })()}
-            <NavButtons
-              onBack={() => setStep(7)}
-              onNext={() => {
-                loadCategories();
-                setStep(9);
-              }}
-            />
-          </section>
-        )}
-
-        {step === 9 && (
-          <section>
-            {categoriesWarning && (
-              <p className="mb-4 rounded-lg bg-amber-50 p-3 text-sm text-amber-800 ring-1 ring-inset ring-amber-200">
-                {categoriesWarning}
-              </p>
-            )}
-            <p className="mb-4 text-sm text-slate-600">
-              Map each Smartlead lead category to a status value written into the CRM. Categories
-              whose value is <code className="rounded bg-slate-100 px-1 py-0.5">positive_reply</code> or{' '}
-              <code className="rounded bg-slate-100 px-1 py-0.5">meeting_booked</code> also unlock
-              those event types for dispatch.
-            </p>
-            <div className="space-y-2">
-              {Object.keys(statusMap).map((category) => (
-                <div key={category} className="flex items-center gap-3">
-                  <span className="w-44 flex-none text-sm text-slate-700">{category}</span>
-                  <input
-                    className={inputClass}
-                    value={statusMap[category]}
-                    onChange={(e) => setStatusMap({ ...statusMap, [category]: e.target.value })}
-                  />
-                </div>
-              ))}
-              {categories
-                .filter((c) => !(c.name in statusMap))
-                .map((c) => (
-                  <div key={c.name} className="flex items-center gap-3">
-                    <span className="w-44 flex-none text-sm text-slate-700">{c.name}</span>
-                    <input
-                      className={inputClass}
-                      placeholder="e.g. nurture"
-                      onChange={(e) => setStatusMap({ ...statusMap, [c.name]: e.target.value })}
-                    />
-                  </div>
-                ))}
-            </div>
             <NavButtons onBack={() => setStep(8)} onNext={() => setStep(10)} />
           </section>
         )}
