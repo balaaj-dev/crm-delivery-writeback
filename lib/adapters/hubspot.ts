@@ -33,6 +33,7 @@ import type {
   CrmAdapter,
   CrmDealStageDescriptor,
   CrmFieldDescriptor,
+  CrmOwnerDescriptor,
 } from '../types';
 import { logger } from '../log';
 
@@ -267,6 +268,14 @@ export const hubspotAdapter: CrmAdapter = {
     // API-created contact to non-marketing on its own, and the property
     // that would flag otherwise is read-only via the API regardless.
 
+    // Required owner (Jairo's 26 Aug 2026 feedback) — same `hubspot_owner_id`
+    // property HubSpot uses on both contacts and deals. The wizard blocks
+    // completion without cfg.behaviour.ownerId set; this is the one place
+    // that value actually lands on a real object.
+    if (cfg.behaviour.ownerId) {
+      properties.hubspot_owner_id = cfg.behaviour.ownerId;
+    }
+
     const res = await hubspotFetch(cfg, '/crm/v3/objects/contacts', {
       method: 'POST',
       body: JSON.stringify({ properties }),
@@ -419,6 +428,9 @@ export const hubspotAdapter: CrmAdapter = {
         properties: {
           dealname: `Cymate writeback — ${ref.id}`,
           ...stageProperties,
+          // Required owner (Jairo's 26 Aug 2026 feedback) — deal owner in
+          // this case, same property name HubSpot uses for contact owner.
+          ...(cfg.behaviour.ownerId ? { hubspot_owner_id: cfg.behaviour.ownerId } : {}),
         },
       }),
     });
@@ -487,6 +499,30 @@ export const hubspotAdapter: CrmAdapter = {
         pipelineId: pipeline.id,
       })),
     );
+  },
+
+  /**
+   * Powers the wizard's required owner picker (step 7, added per Jairo's
+   * 26 Aug 2026 feedback). `GET /crm/v3/owners` confirmed a real, live
+   * endpoint (26 Aug 2026) — it correctly returns a MISSING_SCOPES error
+   * naming `crm.objects.owners.read` rather than a 404, which only happens
+   * for a genuine, recognized route. Not yet verified with a token that
+   * actually has that scope — add it to any Service Key that needs this
+   * step to work, alongside the deal scopes.
+   */
+  async listOwners(cfg): Promise<CrmOwnerDescriptor[]> {
+    const res = await hubspotFetch(cfg, '/crm/v3/owners?limit=200');
+    if (!res.ok) {
+      throw new HubspotApiError(res.status, `HubSpot listOwners failed: ${hubspotErrorSummary(await res.text())}`);
+    }
+    const body = (await res.json()) as {
+      results: Array<{ id: string; email?: string; firstName?: string; lastName?: string }>;
+    };
+    return body.results.map((o) => ({
+      id: o.id,
+      label: [o.firstName, o.lastName].filter(Boolean).join(' ') || o.email || o.id,
+      email: o.email,
+    }));
   },
 
   async testConnection(cfg) {

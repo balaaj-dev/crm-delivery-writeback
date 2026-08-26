@@ -10,6 +10,7 @@ import type { ClientConfig } from './types';
 import { clientConfigSchema } from './schemas';
 import { listClientConfigsFromAirtable } from './airtable';
 import { logger } from './log';
+import { encryptRecord, decryptRecord } from './crypto';
 
 export type ConfigSource = 'fixtures' | 'airtable';
 
@@ -75,7 +76,8 @@ async function loadFixtureClients(): Promise<ClientConfig[]> {
  */
 const OVERRIDES_FILE_PATH = path.join(process.cwd(), 'data', 'client-overrides.json');
 
-async function readOverrides(): Promise<Record<string, ClientConfig>> {
+/** Raw on-disk shape — credentials still encrypted. Never hand this to a caller directly. */
+async function readOverridesRaw(): Promise<Record<string, ClientConfig>> {
   try {
     const raw = await readFile(OVERRIDES_FILE_PATH, 'utf8');
     return JSON.parse(raw) as Record<string, ClientConfig>;
@@ -84,10 +86,28 @@ async function readOverrides(): Promise<Record<string, ClientConfig>> {
   }
 }
 
+/** Decrypts every entry's crm.credentials for in-memory use — see lib/crypto.ts. */
+async function readOverrides(): Promise<Record<string, ClientConfig>> {
+  const overrides = await readOverridesRaw();
+  for (const cfg of Object.values(overrides)) {
+    cfg.crm.credentials = decryptRecord(cfg.crm.credentials);
+  }
+  return overrides;
+}
+
+/**
+ * Encrypts crm.credentials before it ever touches disk (lib/crypto.ts).
+ * Reads the RAW (still-encrypted) file first, not the decrypted view —
+ * otherwise every other client's already-encrypted credentials would get
+ * silently rewritten as plaintext just because one client's config changed.
+ */
 export async function setSessionOverride(config: ClientConfig): Promise<void> {
   try {
-    const overrides = await readOverrides();
-    overrides[config.clientId] = config;
+    const overrides = await readOverridesRaw();
+    overrides[config.clientId] = {
+      ...config,
+      crm: { ...config.crm, credentials: encryptRecord(config.crm.credentials) },
+    };
     await mkdir(path.dirname(OVERRIDES_FILE_PATH), { recursive: true });
     await writeFile(OVERRIDES_FILE_PATH, JSON.stringify(overrides, null, 2), 'utf8');
   } catch (err) {

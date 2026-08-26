@@ -81,6 +81,10 @@ export interface SmartleadLead {
   sequenceStatus?: string;
   /** Smartlead's own lead-category id for this campaign (null until the lead replies/gets triaged) — see resolveInterestCategoryIds. */
   leadCategoryId?: number | null;
+  /** Company website/domain — Smartlead's own top-level `website` lead field (confirmed live, 26 Aug 2026). */
+  domain?: string;
+  /** Per-workspace custom fields (e.g. Company_City, Apollo_Industry), keyed by their raw Smartlead name. */
+  customFields?: Record<string, string>;
 }
 
 /**
@@ -116,6 +120,7 @@ export async function listCampaignLeads(
         first_name?: string;
         last_name?: string;
         company_name?: string;
+        website?: string | null;
         phone_number?: string | null;
         linkedin_profile?: string | null;
         custom_fields?: Record<string, string>;
@@ -130,13 +135,30 @@ export async function listCampaignLeads(
       firstName: entry.lead.first_name,
       lastName: entry.lead.last_name,
       company: entry.lead.company_name,
+      domain: entry.lead.website ?? undefined,
       title: entry.lead.custom_fields?.Title,
       phone: entry.lead.phone_number ?? undefined,
       linkedinUrl: entry.lead.linkedin_profile ?? undefined,
       sequenceStatus: entry.status,
       leadCategoryId: entry.lead_category_id ?? null,
+      customFields: entry.lead.custom_fields,
     })),
   };
+}
+
+/**
+ * Samples one real lead from a campaign and returns the keys of whatever
+ * custom fields exist on it (e.g. Company_City, Apollo_Industry) — these are
+ * per-workspace and not knowable in advance, so this is the only way to
+ * discover them short of Smartlead exposing a real fields-schema endpoint
+ * (it doesn't). Powers the wizard's "browse Smartlead fields" step (added
+ * per Jairo's 26 Aug 2026 feedback). Returns an empty list, not an error, if
+ * the campaign has no leads yet — nothing to browse is a normal state, not
+ * a failure.
+ */
+export async function sampleLeadCustomFieldKeys(apiKey: string, campaignId: string): Promise<string[]> {
+  const { leads } = await listCampaignLeads(apiKey, campaignId, 1, 0);
+  return leads[0]?.customFields ? Object.keys(leads[0].customFields) : [];
 }
 
 export interface SmartleadMessage {

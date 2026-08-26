@@ -6,14 +6,10 @@ import { CRM_TYPES } from '@/lib/types';
 import { logger } from '@/lib/log';
 
 /**
- * Deal-stage picker. Real stage IDs are portal-specific (confirmed live
- * against HubSpot, see docs/HANDOVER.md), so this must be fetched, never
- * guessed. Not every CRM adapter implements listDealStages (only ones with
- * a deal/opportunity concept need to) — callers should fall back to a
- * plain text field when `stages` comes back empty.
- *
- * POST, not GET — same fix as /api/crm/[type]/fields (26 Aug 2026): must
- * use the credentials the CSM just tested, not whatever's already saved.
+ * Wizard step 7 — required owner picker (added per Jairo's 26 Aug 2026
+ * feedback: owner assignment needs a real guardrail, not a default). Same
+ * fresh-credentials POST pattern as fields/deal-stages — must use what the
+ * CSM just tested, not whatever's already saved.
  */
 export async function POST(req: Request, { params }: { params: { type: string } }) {
   const type = params.type as CrmType;
@@ -44,21 +40,21 @@ export async function POST(req: Request, { params }: { params: { type: string } 
   };
 
   const adapter = ADAPTER_REGISTRY[type]();
-  if (!adapter.listDealStages) {
-    return NextResponse.json({ stages: [] });
+  if (!adapter.listOwners) {
+    return NextResponse.json({ owners: [], warning: `${type} doesn't support owner lookup yet.` });
   }
 
   try {
-    const stages = await adapter.listDealStages(cfg);
-    return NextResponse.json({ stages });
+    const owners = await adapter.listOwners(cfg);
+    return NextResponse.json({ owners });
   } catch (err) {
-    logger.warn('listDealStages failed — wizard should fall back to manual entry', {
+    logger.warn('listOwners failed — wizard owner picker will show a warning and stay blocked', {
       type,
       error: err instanceof Error ? err.message : err,
     });
     return NextResponse.json({
-      stages: [],
-      warning: err instanceof Error ? err.message : 'Could not fetch deal stages.',
+      owners: [],
+      warning: err instanceof Error ? err.message : 'Could not fetch owners.',
     });
   }
 }

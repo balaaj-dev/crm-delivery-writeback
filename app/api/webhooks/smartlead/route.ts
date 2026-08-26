@@ -9,18 +9,22 @@ import { logger } from '@/lib/log';
  * Ingestion endpoint for the 7 approved Smartlead webhook events (brief §6).
  *
  * clientId is passed as a query param, set at webhook-registration time
- * (wizard step 10 / POST /api/webhooks/register) — Smartlead itself has no
- * concept of "Cymate client ID", so each registered webhook URL is scoped
- * to one client: /api/webhooks/smartlead?clientId=<Airtable record id>.
+ * (POST /api/webhooks/register) — Smartlead itself has no concept of
+ * "Cymate client ID", so each registered webhook URL is scoped to one
+ * client: /api/webhooks/smartlead?clientId=<Airtable record id>&secret=...
  *
- * [VERIFY] Smartlead webhook signature verification. SMARTLEAD_WEBHOOK_SECRET
- * exists as an env var placeholder (see .env.example) but is not checked
- * here — brief §16 flags this as unconfirmed ("[VERIFY] whether Smartlead
- * provides one"). Do not treat this endpoint as verified against payload
- * spoofing until that's resolved — see docs/HANDOVER.md.
+ * Security check added 26 Aug 2026 (Jairo's feedback: this endpoint had
+ * none). Smartlead doesn't document a request-signing scheme to verify
+ * against — SMARTLEAD_WEBHOOK_SECRET was an unused env var placeholder for
+ * exactly that reason — so this uses a shared secret instead: a random
+ * value generated per client at registration time, embedded in the URL we
+ * hand to Smartlead, and required on every call here. A client with no
+ * secret configured yet (registration never run) rejects everything —
+ * fail closed, not open, consistent with this app's other safety defaults.
  */
 export async function POST(req: Request) {
-  const clientId = new URL(req.url).searchParams.get('clientId');
+  const url = new URL(req.url);
+  const clientId = url.searchParams.get('clientId');
   if (!clientId) {
     return NextResponse.json({ error: 'Missing required ?clientId= query param' }, { status: 400 });
   }
@@ -28,6 +32,12 @@ export async function POST(req: Request) {
   const cfg = await getClientConfig(clientId);
   if (!cfg) {
     return NextResponse.json({ error: `No client config found for id ${clientId}` }, { status: 404 });
+  }
+
+  const presentedSecret = url.searchParams.get('secret');
+  if (!cfg.source.webhookSecret || presentedSecret !== cfg.source.webhookSecret) {
+    logger.warn('smartlead webhook: rejected call with missing/invalid secret', { clientId });
+    return NextResponse.json({ error: 'Missing or invalid webhook secret' }, { status: 401 });
   }
 
   let body: unknown;

@@ -1,33 +1,58 @@
 'use client';
 
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   CRM_TYPES,
   IMPLEMENTED_CRM_TYPES,
-  MODE_PRESETS,
   DEFAULT_FIELD_MAP,
   type ClientConfig,
   type CrmType,
   type CrmDealStageDescriptor,
   type CrmFieldDescriptor,
+  type CrmOwnerDescriptor,
   type FieldMapping,
   type WritebackMode,
 } from '@/lib/types';
 
+/**
+ * Step order reshaped per Jairo's 26 Aug 2026 feedback: the decisions that
+ * determine everything downstream (record type, sync scope) now happen
+ * right after the client summary instead of being scattered across the old
+ * steps 3/4/11 — because whether this is a deal or just a contact changes
+ * what step 7 needs to ask for (deal owner + stage vs. just a contact
+ * owner), that choice can't come late. Old steps 3 (campaigns) and 4
+ * (partial/full) and step 11's create-deal toggle are merged into the new
+ * step 3 below; step 11 is now a slimmed "configure the deal" step that
+ * only applies once record type is already decided.
+ */
 const STEP_TITLES = [
   'Select client',
   'Auto-populated summary',
-  'Select campaigns',
-  'Writeback mode',
+  'Sync scope & record type',
   'Select CRM',
   'CRM branch',
   'CRM credentials',
   'Field mapping',
   'Deliver contacts',
   'Status mapping',
-  'Record behaviour + plan check',
+  'Record behaviour',
   'Review and build',
 ];
+
+type SyncScope = 'positive_replies_only' | 'all_contacts' | 'specific_campaigns';
+
+interface DeliveryJobView {
+  id: string;
+  campaignId: string;
+  status: string;
+  processed: number;
+  created: number;
+  alreadyExisted: number;
+  activitiesLogged: number;
+  skippedNotInterested: number;
+  totalLeadsInCampaign?: number;
+  errors: Array<{ email: string; reason: string }>;
+}
 
 function maskSecret(value: string | undefined): string {
   if (!value) return '(not set)';
@@ -121,7 +146,12 @@ export default function SetupWizard() {
   const [campaignsWarning, setCampaignsWarning] = useState<string | null>(null);
   const [selectedCampaignIds, setSelectedCampaignIds] = useState<string[]>([]);
 
+  const [syncScope, setSyncScope] = useState<SyncScope>('positive_replies_only');
   const [mode, setMode] = useState<WritebackMode>('partial');
+  const [createRecordOnInterestedReply, setCreateRecordOnInterestedReply] = useState(true);
+  const [createRecordForAllLeads, setCreateRecordForAllLeads] = useState(false);
+  const [createDeal, setCreateDeal] = useState(false);
+
   const [crmType, setCrmType] = useState<CrmType>('hubspot');
   const [credentials, setCredentials] = useState<Record<string, string>>({});
   const [testResult, setTestResult] = useState<{ ok: boolean; message: string } | null>(null);
@@ -130,35 +160,29 @@ export default function SetupWizard() {
   const [fields, setFields] = useState<CrmFieldDescriptor[]>([]);
   const [fieldMap, setFieldMap] = useState<FieldMapping[]>(DEFAULT_FIELD_MAP);
 
+  const [owners, setOwners] = useState<CrmOwnerDescriptor[]>([]);
+  const [ownersWarning, setOwnersWarning] = useState<string | null>(null);
+  const [ownerId, setOwnerId] = useState('');
+
+  const [smartleadFieldOptions, setSmartleadFieldOptions] = useState<string[]>([]);
+  const [smartleadFieldsWarning, setSmartleadFieldsWarning] = useState<string | null>(null);
+  const [smartleadFieldsLoaded, setSmartleadFieldsLoaded] = useState(false);
+  const [smartleadFieldsLoading, setSmartleadFieldsLoading] = useState(false);
+
   const [categories, setCategories] = useState<{ id: string | number; name: string }[]>([]);
   const [categoriesWarning, setCategoriesWarning] = useState<string | null>(null);
   const [statusMap, setStatusMap] = useState<Record<string, string>>({});
 
-  const [createRecordOnInterestedReply, setCreateRecordOnInterestedReply] = useState(true);
-  const [createRecordForAllLeads, setCreateRecordForAllLeads] = useState(false);
-  const [createDeal, setCreateDeal] = useState(false);
   const [dealStageOnCreate, setDealStageOnCreate] = useState('');
   const [dealStages, setDealStages] = useState<CrmDealStageDescriptor[]>([]);
   const [dealStagesWarning, setDealStagesWarning] = useState<string | null>(null);
   const [planLimitAcknowledged, setPlanLimitAcknowledged] = useState(false);
 
-  const [deliveryMaxLeads, setDeliveryMaxLeads] = useState(25);
-  const [deliveryResults, setDeliveryResults] = useState<
-    Array<{
-      campaignId: string;
-      error?: string;
-      result?: {
-        totalLeadsInCampaign: number;
-        processed: number;
-        created: number;
-        alreadyExisted: number;
-        activitiesLogged: number;
-        errors: Array<{ email: string; reason: string }>;
-        cappedAt?: number;
-      };
-    }>
-  >([]);
+  const [deliveryTargetLeads] = useState(100000); // effectively "scan the whole campaign" — the background job stops on its own once the campaign is exhausted
+  const [deliveryJobs, setDeliveryJobs] = useState<DeliveryJobView[]>([]);
   const [delivering, setDelivering] = useState(false);
+  const [deliveryError, setDeliveryError] = useState<string | null>(null);
+  const pollingRef = useRef(false);
 
   const [building, setBuilding] = useState(false);
   const [buildResult, setBuildResult] = useState<unknown>(null);
@@ -178,11 +202,24 @@ export default function SetupWizard() {
       .catch((err) => setLoadError(String(err)));
   }, []);
 
-  function applyModePreset(next: WritebackMode) {
-    setMode(next);
-    const preset = MODE_PRESETS[next];
-    setCreateRecordOnInterestedReply(preset.behaviour.createRecordOnInterestedReply ?? true);
-    setCreateRecordForAllLeads(preset.behaviour.createRecordForAllLeads ?? false);
+  function applySyncScope(scope: SyncScope) {
+    setSyncScope(scope);
+    if (scope === 'positive_replies_only') {
+      setMode('partial');
+      setCreateRecordOnInterestedReply(true);
+      setCreateRecordForAllLeads(false);
+      setSelectedCampaignIds([]); // no campaign scoping needed — Jairo's feedback: PRs-only shouldn't require picking campaigns
+    } else if (scope === 'all_contacts') {
+      setMode('full');
+      setCreateRecordOnInterestedReply(true);
+      setCreateRecordForAllLeads(true);
+      setSelectedCampaignIds([]); // "everything" option — empty campaignIds already means all campaigns
+    } else {
+      setMode('full');
+      setCreateRecordOnInterestedReply(true);
+      setCreateRecordForAllLeads(true);
+      // selectedCampaignIds is left as-is — the picker below drives it
+    }
   }
 
   async function loadCampaigns() {
@@ -208,11 +245,51 @@ export default function SetupWizard() {
   }
 
   async function loadFields() {
-    const res = await fetch(
-      `/api/crm/${crmType}/fields?clientId=${encodeURIComponent(selectedClientId)}&objectType=contact`,
-    );
+    const res = await fetch(`/api/crm/${crmType}/fields`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ clientId: selectedClientId, credentials, objectType: 'contact' }),
+    });
     const data = await res.json();
     setFields(data.fields ?? []);
+  }
+
+  async function loadOwners() {
+    const res = await fetch(`/api/crm/${crmType}/owners`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ clientId: selectedClientId, credentials }),
+    });
+    const data = await res.json();
+    setOwners(data.owners ?? []);
+    setOwnersWarning(data.warning ?? null);
+  }
+
+  async function loadSmartleadFieldOptions() {
+    setSmartleadFieldsLoading(true);
+    try {
+      const campaignId = selectedCampaignIds[0];
+      const url = new URL('/api/smartlead/sample-fields', window.location.origin);
+      url.searchParams.set('clientId', selectedClientId);
+      if (campaignId) url.searchParams.set('campaignId', campaignId);
+      const res = await fetch(url);
+      const data = await res.json();
+      setSmartleadFieldOptions(data.fields ?? []);
+      setSmartleadFieldsWarning(data.warning ?? null);
+      setSmartleadFieldsLoaded(true);
+    } finally {
+      setSmartleadFieldsLoading(false);
+    }
+  }
+
+  function addCustomFieldMapping(key: string) {
+    const canonical = `prospect.custom.${key}`;
+    if (fieldMap.some((m) => m.canonical === canonical)) return;
+    setFieldMap([...fieldMap, { canonical, crmObject: 'contact', crmField: fields[0]?.name ?? '', direction: 'out' }]);
+  }
+
+  function removeFieldMapping(canonical: string) {
+    setFieldMap(fieldMap.filter((m) => m.canonical !== canonical));
   }
 
   async function loadCategories() {
@@ -224,33 +301,77 @@ export default function SetupWizard() {
   }
 
   async function loadDealStages() {
-    const res = await fetch(
-      `/api/crm/${crmType}/deal-stages?clientId=${encodeURIComponent(selectedClientId)}`,
-    );
+    const res = await fetch(`/api/crm/${crmType}/deal-stages`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ clientId: selectedClientId, credentials }),
+    });
     const data = await res.json();
     setDealStages(data.stages ?? []);
     setDealStagesWarning(data.warning ?? null);
   }
 
-  async function runDelivery() {
-    setDelivering(true);
-    setDeliveryResults([]);
-    try {
-      const results = [];
-      for (const campaignId of selectedCampaignIds) {
-        const res = await fetch('/api/delivery/run', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ clientId: selectedClientId, campaignId, maxLeads: deliveryMaxLeads }),
-        });
-        const data = await res.json();
-        results.push({ campaignId, result: data.result, error: data.error });
+  /** Which campaigns delivery should actually run against — explicit picks, or every currently-active campaign when the sync scope skipped campaign selection. */
+  function deliveryCampaignIds(): string[] {
+    if (selectedCampaignIds.length > 0) return selectedCampaignIds;
+    return campaigns.filter((c) => c.status === 'ACTIVE').map((c) => c.id);
+  }
+
+  async function pollDeliveryJobs(jobIds: string[]) {
+    pollingRef.current = true;
+    while (pollingRef.current) {
+      const results = await Promise.all(
+        jobIds.map((id) => fetch(`/api/delivery/jobs/${id}`).then((r) => r.json())),
+      );
+      const views: DeliveryJobView[] = results.map((r) => r.job).filter(Boolean);
+      setDeliveryJobs(views);
+      const allDone = views.length === jobIds.length && views.every((j) => j.status === 'completed' || j.status === 'failed');
+      if (allDone) {
+        pollingRef.current = false;
+        setDelivering(false);
+        break;
       }
-      setDeliveryResults(results);
-    } finally {
+      await new Promise((resolve) => setTimeout(resolve, 3000));
+    }
+  }
+
+  async function startDelivery() {
+    setDeliveryError(null);
+    const targetCampaignIds = deliveryCampaignIds();
+    if (targetCampaignIds.length === 0) {
+      setDeliveryError('No campaigns to deliver from — none are selected and none are currently active.');
+      return;
+    }
+    setDelivering(true);
+    setDeliveryJobs([]);
+    try {
+      const started = await Promise.all(
+        targetCampaignIds.map((campaignId) =>
+          fetch('/api/delivery/jobs', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ clientId: selectedClientId, campaignId, targetLeads: deliveryTargetLeads }),
+          }).then((r) => r.json()),
+        ),
+      );
+      const jobIds = started.map((s) => s.job?.id).filter(Boolean) as string[];
+      if (jobIds.length === 0) {
+        setDeliveryError('Could not start any delivery jobs — see the errors below.');
+        setDelivering(false);
+        return;
+      }
+      pollDeliveryJobs(jobIds);
+    } catch (err) {
+      setDeliveryError(err instanceof Error ? err.message : String(err));
       setDelivering(false);
     }
   }
+
+  useEffect(() => {
+    return () => {
+      pollingRef.current = false;
+    };
+  }, []);
 
   async function runBuild() {
     setBuilding(true);
@@ -276,8 +397,17 @@ export default function SetupWizard() {
           createDeal,
           dealStageOnCreate: dealStageOnCreate || undefined,
           planLimitAcknowledged,
+          ownerId: ownerId || undefined,
         },
-        events: MODE_PRESETS[mode].events,
+        events: {
+          email_sent: syncScope === 'all_contacts' || syncScope === 'specific_campaigns',
+          reply: true,
+          positive_reply: true,
+          bounce: true,
+          unsubscribe: true,
+          status_change: true,
+          meeting_booked: true,
+        },
         fieldMap,
         statusMap,
         notifications: selectedClient?.notifications ?? {},
@@ -322,6 +452,8 @@ export default function SetupWizard() {
 
   const isSalesforce = crmType === 'salesforce';
   const isImplemented = (IMPLEMENTED_CRM_TYPES as string[]).includes(crmType);
+  const ownerLabel = createDeal ? 'Deal owner' : 'Contact owner';
+  const ownerGuardrailBlocked = owners.length === 0 || !ownerId;
 
   return (
     <main className="mx-auto max-w-3xl px-6 py-12">
@@ -399,84 +531,146 @@ export default function SetupWizard() {
         )}
 
         {step === 3 && (
-          <section>
-            {campaignsWarning && (
-              <p className="mb-4 rounded-lg bg-amber-50 p-3 text-sm text-amber-800 ring-1 ring-inset ring-amber-200">
-                {campaignsWarning}
+          <section className="space-y-6">
+            <div>
+              <p className="mb-3 text-sm text-slate-600">
+                What should get synced from Smartlead into the CRM. This decision drives what step 7
+                asks for next, so it happens up front.
               </p>
-            )}
-            <p className="mb-4 text-sm text-slate-600">
-              Choose which Smartlead campaigns this client&apos;s writeback covers. Webhooks are only
-              registered for campaigns selected here — pick nothing and nothing will sync.
-            </p>
-            {campaigns.length === 0 ? (
-              <p className="rounded-lg border border-dashed border-slate-300 p-4 text-sm text-slate-500">
-                No campaigns found for this client&apos;s Smartlead account yet.
-              </p>
-            ) : (
-              <div className="space-y-2">
-                {campaigns.map((c) => (
+              <div className="space-y-3">
+                {(
+                  [
+                    {
+                      value: 'positive_replies_only' as SyncScope,
+                      title: 'Sync only positive replies',
+                      desc: 'Only creates a CRM record once someone replies with genuine interest. No campaign picker needed — covers the whole account. Keeps CRM contact volume — and cost — low.',
+                    },
+                    {
+                      value: 'all_contacts' as SyncScope,
+                      title: 'Sync all contacts',
+                      desc: 'Creates a CRM record for every lead across the whole account. No campaign picker needed — this is the "everything" option.',
+                    },
+                    {
+                      value: 'specific_campaigns' as SyncScope,
+                      title: 'Sync specific campaigns',
+                      desc: 'Pick exactly which Smartlead campaigns should sync — every lead in those campaigns gets a CRM record.',
+                    },
+                  ] as const
+                ).map((opt) => (
                   <label
-                    key={c.id}
-                    className="flex items-center gap-2.5 rounded-lg border border-slate-200 px-3 py-2 text-sm"
+                    key={opt.value}
+                    className={`block cursor-pointer rounded-xl border p-4 transition ${
+                      syncScope === opt.value
+                        ? 'border-cymate-orange bg-cymate-orange/5 ring-1 ring-cymate-orange/30'
+                        : 'border-slate-200 hover:border-slate-300'
+                    }`}
                   >
-                    <input
-                      type="checkbox"
-                      className="h-4 w-4 accent-cymate-orange"
-                      checked={selectedCampaignIds.includes(c.id)}
-                      onChange={(e) =>
-                        setSelectedCampaignIds((prev) =>
-                          e.target.checked ? [...prev, c.id] : prev.filter((id) => id !== c.id),
-                        )
-                      }
-                    />
-                    <span className="flex-1 text-cymate-navy">{c.name}</span>
-                    <span className="text-xs uppercase text-slate-400">{c.status}</span>
+                    <span className="flex items-center gap-2">
+                      <input
+                        type="radio"
+                        name="syncScope"
+                        className="accent-cymate-orange"
+                        checked={syncScope === opt.value}
+                        onChange={() => applySyncScope(opt.value)}
+                      />
+                      <span className="font-semibold text-cymate-navy">{opt.title}</span>
+                    </span>
+                    <p className="mt-1 pl-6 text-sm text-slate-600">{opt.desc}</p>
                   </label>
                 ))}
               </div>
+            </div>
+
+            {syncScope === 'specific_campaigns' && (
+              <div>
+                {campaignsWarning && (
+                  <p className="mb-3 rounded-lg bg-amber-50 p-3 text-sm text-amber-800 ring-1 ring-inset ring-amber-200">
+                    {campaignsWarning}
+                  </p>
+                )}
+                {campaigns.length === 0 ? (
+                  <p className="rounded-lg border border-dashed border-slate-300 p-4 text-sm text-slate-500">
+                    No campaigns found for this client&apos;s Smartlead account yet.
+                  </p>
+                ) : (
+                  <div className="space-y-2">
+                    {campaigns.map((c) => (
+                      <label
+                        key={c.id}
+                        className="flex items-center gap-2.5 rounded-lg border border-slate-200 px-3 py-2 text-sm"
+                      >
+                        <input
+                          type="checkbox"
+                          className="h-4 w-4 accent-cymate-orange"
+                          checked={selectedCampaignIds.includes(c.id)}
+                          onChange={(e) =>
+                            setSelectedCampaignIds((prev) =>
+                              e.target.checked ? [...prev, c.id] : prev.filter((id) => id !== c.id),
+                            )
+                          }
+                        />
+                        <span className="flex-1 text-cymate-navy">{c.name}</span>
+                        <span className="text-xs uppercase text-slate-400">{c.status}</span>
+                      </label>
+                    ))}
+                  </div>
+                )}
+              </div>
             )}
+
+            <div className="border-t border-slate-100 pt-5">
+              <p className="mb-3 text-sm font-medium text-slate-700">
+                What should get created — a contact, or a contact and a deal?
+              </p>
+              <div className="grid grid-cols-2 gap-3">
+                <label
+                  className={`cursor-pointer rounded-xl border p-3 text-sm transition ${
+                    !createDeal
+                      ? 'border-cymate-orange bg-cymate-orange/5 ring-1 ring-cymate-orange/30'
+                      : 'border-slate-200 hover:border-slate-300'
+                  }`}
+                >
+                  <input
+                    type="radio"
+                    name="recordType"
+                    className="mr-2 accent-cymate-orange"
+                    checked={!createDeal}
+                    onChange={() => setCreateDeal(false)}
+                  />
+                  <span className="font-semibold text-cymate-navy">Contact only</span>
+                </label>
+                <label
+                  className={`cursor-pointer rounded-xl border p-3 text-sm transition ${
+                    createDeal
+                      ? 'border-cymate-orange bg-cymate-orange/5 ring-1 ring-cymate-orange/30'
+                      : 'border-slate-200 hover:border-slate-300'
+                  }`}
+                >
+                  <input
+                    type="radio"
+                    name="recordType"
+                    className="mr-2 accent-cymate-orange"
+                    checked={createDeal}
+                    onChange={() => setCreateDeal(true)}
+                  />
+                  <span className="font-semibold text-cymate-navy">Contact + Deal</span>
+                </label>
+              </div>
+              <p className="mt-2 text-xs text-slate-500">
+                Contact + Deal means step 7 will ask for a deal owner and step 10 will ask which
+                pipeline stage new deals open in. Contact only just needs a contact owner.
+              </p>
+            </div>
+
             <NavButtons
               onBack={() => setStep(2)}
               onNext={() => setStep(4)}
-              nextDisabled={campaigns.length > 0 && selectedCampaignIds.length === 0}
+              nextDisabled={syncScope === 'specific_campaigns' && campaigns.length > 0 && selectedCampaignIds.length === 0}
             />
           </section>
         )}
 
         {step === 4 && (
-          <section className="space-y-3">
-            {(['partial', 'full'] as WritebackMode[]).map((m) => (
-              <label
-                key={m}
-                className={`block cursor-pointer rounded-xl border p-4 transition ${
-                  mode === m
-                    ? 'border-cymate-orange bg-cymate-orange/5 ring-1 ring-cymate-orange/30'
-                    : 'border-slate-200 hover:border-slate-300'
-                }`}
-              >
-                <span className="flex items-center gap-2">
-                  <input
-                    type="radio"
-                    name="mode"
-                    className="accent-cymate-orange"
-                    checked={mode === m}
-                    onChange={() => applyModePreset(m)}
-                  />
-                  <span className="font-semibold capitalize text-cymate-navy">{m}</span>
-                </span>
-                <p className="mt-1 pl-6 text-sm text-slate-600">
-                  {m === 'partial'
-                    ? 'Only creates a CRM record when an interested reply arrives. Keeps HubSpot marketing-contact volume — and cost — low.'
-                    : 'Writes every lead. Only appropriate when the client’s CRM plan supports the contact volume.'}
-                </p>
-              </label>
-            ))}
-            <NavButtons onBack={() => setStep(3)} onNext={() => setStep(5)} />
-          </section>
-        )}
-
-        {step === 5 && (
           <section>
             <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
               {CRM_TYPES.map((type) => {
@@ -510,11 +704,11 @@ export default function SetupWizard() {
                 );
               })}
             </div>
-            <NavButtons onBack={() => setStep(4)} onNext={() => setStep(6)} />
+            <NavButtons onBack={() => setStep(3)} onNext={() => setStep(5)} />
           </section>
         )}
 
-        {step === 6 && (
+        {step === 5 && (
           <section>
             {isSalesforce ? (
               <div className="rounded-xl border border-cymate-orange/30 bg-cymate-orange/5 p-4 text-sm text-cymate-navy">
@@ -538,11 +732,11 @@ export default function SetupWizard() {
                 working adapter in this skeleton. Continue to enter credentials.
               </p>
             )}
-            <NavButtons onBack={() => setStep(5)} onNext={() => setStep(7)} nextDisabled={isSalesforce} />
+            <NavButtons onBack={() => setStep(4)} onNext={() => setStep(6)} nextDisabled={isSalesforce} />
           </section>
         )}
 
-        {step === 7 && (
+        {step === 6 && (
           <section>
             <label className="block text-sm font-medium text-slate-700">
               {crmType === 'hubspot' ? 'HubSpot Service Key access token' : 'Access token / API key'}
@@ -552,7 +746,7 @@ export default function SetupWizard() {
               className={`mt-2 ${inputClass}`}
               value={credentials.accessToken ?? ''}
               onChange={(e) => setCredentials({ ...credentials, accessToken: e.target.value })}
-              placeholder="Paste credential — never committed, stored only in Airtable/env for this skeleton"
+              placeholder="Paste credential — never committed, encrypted at rest for this skeleton"
             />
             <button
               onClick={runTestConnection}
@@ -573,135 +767,225 @@ export default function SetupWizard() {
               </p>
             )}
             <NavButtons
-              onBack={() => setStep(6)}
+              onBack={() => setStep(5)}
               onNext={() => {
                 loadFields();
-                setStep(8);
+                loadOwners();
+                setStep(7);
               }}
               nextDisabled={!testResult?.ok}
             />
           </section>
         )}
 
-        {step === 8 && (
+        {step === 7 && (
           <section>
             <p className="mb-4 text-sm text-slate-600">
               Canonical field on the left, real {crmType} field on the right. Pre-filled with sane
               defaults — adjust per client.
             </p>
             <div className="space-y-2">
-              {fieldMap.map((mapping, i) => (
-                <div key={mapping.canonical} className="flex items-center gap-3">
-                  <span className="w-44 flex-none rounded-md bg-slate-50 px-2 py-1.5 font-mono text-xs text-slate-600">
-                    {mapping.canonical}
-                  </span>
-                  <select
-                    className={inputClass}
-                    value={mapping.crmField}
-                    onChange={(e) => {
-                      const next = [...fieldMap];
-                      next[i] = { ...mapping, crmField: e.target.value };
-                      setFieldMap(next);
-                    }}
-                  >
-                    {fields.length === 0 && <option value={mapping.crmField}>{mapping.crmField}</option>}
-                    {fields.map((f) => (
-                      <option key={f.name} value={f.name}>
-                        {f.label} ({f.name})
-                      </option>
-                    ))}
-                  </select>
-                </div>
-              ))}
+              {fieldMap.map((mapping, i) => {
+                const isCustom = mapping.canonical.startsWith('prospect.custom.');
+                return (
+                  <div key={mapping.canonical} className="flex items-center gap-3">
+                    <span className="w-44 flex-none rounded-md bg-slate-50 px-2 py-1.5 font-mono text-xs text-slate-600">
+                      {mapping.canonical}
+                    </span>
+                    <select
+                      className={inputClass}
+                      value={mapping.crmField}
+                      onChange={(e) => {
+                        const next = [...fieldMap];
+                        next[i] = { ...mapping, crmField: e.target.value };
+                        setFieldMap(next);
+                      }}
+                    >
+                      {fields.length === 0 && <option value={mapping.crmField}>{mapping.crmField}</option>}
+                      {fields.map((f) => (
+                        <option key={f.name} value={f.name}>
+                          {f.label} ({f.name})
+                        </option>
+                      ))}
+                    </select>
+                    {isCustom && (
+                      <button
+                        onClick={() => removeFieldMapping(mapping.canonical)}
+                        className="flex-none rounded-md px-2 py-1.5 text-xs text-slate-400 hover:bg-rose-50 hover:text-rose-600"
+                        title="Remove this field mapping"
+                      >
+                        ✕
+                      </button>
+                    )}
+                  </div>
+                );
+              })}
             </div>
-            <NavButtons onBack={() => setStep(7)} onNext={() => setStep(9)} />
+
+            <div className="mt-6 rounded-xl border border-slate-200 p-4">
+              <p className="text-sm font-medium text-slate-700">Browse other Smartlead fields</p>
+              <p className="mt-1 text-xs text-slate-500">
+                Every client&apos;s Smartlead workspace can have its own custom fields (e.g. industry,
+                city). This samples one real lead to show what&apos;s actually available for this
+                client, rather than a fixed list.
+              </p>
+              {!smartleadFieldsLoaded ? (
+                <button
+                  onClick={loadSmartleadFieldOptions}
+                  disabled={smartleadFieldsLoading}
+                  className="mt-3 rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-medium text-slate-700 transition hover:bg-slate-50 disabled:opacity-50"
+                >
+                  {smartleadFieldsLoading ? 'Sampling a lead…' : 'Browse Smartlead fields'}
+                </button>
+              ) : (
+                <>
+                  {smartleadFieldsWarning && (
+                    <p className="mt-2 rounded-lg bg-amber-50 p-2 text-xs text-amber-800 ring-1 ring-inset ring-amber-200">
+                      {smartleadFieldsWarning}
+                    </p>
+                  )}
+                  {smartleadFieldOptions.length === 0 && !smartleadFieldsWarning ? (
+                    <p className="mt-2 text-xs text-slate-500">
+                      No custom fields found on the sampled lead for this client.
+                    </p>
+                  ) : (
+                    <div className="mt-3 flex flex-wrap gap-2">
+                      {smartleadFieldOptions
+                        .filter((key) => !fieldMap.some((m) => m.canonical === `prospect.custom.${key}`))
+                        .map((key) => (
+                          <button
+                            key={key}
+                            onClick={() => addCustomFieldMapping(key)}
+                            className="rounded-full border border-cymate-cyan/40 bg-cymate-cyan/10 px-3 py-1 text-xs font-medium text-cymate-navy transition hover:bg-cymate-cyan/20"
+                          >
+                            + {key}
+                          </button>
+                        ))}
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
+
+            <div className="mt-6 rounded-xl border border-cymate-orange/30 bg-cymate-orange/5 p-4">
+              <label className="block text-sm font-semibold text-cymate-navy">{ownerLabel} — required</label>
+              <p className="mt-1 text-xs text-slate-600">
+                Every record created needs an explicit owner. No default, no falling back to
+                whoever happens to be signed in — pick a real {crmType} user.
+              </p>
+              {ownersWarning && (
+                <p className="mt-2 rounded-lg bg-amber-50 p-2 text-xs text-amber-800 ring-1 ring-inset ring-amber-200">
+                  Couldn&apos;t load {crmType} owners ({ownersWarning}). This step stays blocked until
+                  it can — check the credential&apos;s scopes.
+                </p>
+              )}
+              <select
+                className={`mt-2 ${inputClass}`}
+                value={ownerId}
+                onChange={(e) => setOwnerId(e.target.value)}
+                disabled={owners.length === 0}
+              >
+                <option value="">{owners.length === 0 ? 'No owners available' : `Select a ${ownerLabel.toLowerCase()}…`}</option>
+                {owners.map((o) => (
+                  <option key={o.id} value={o.id}>
+                    {o.label}
+                    {o.email ? ` (${o.email})` : ''}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            <NavButtons onBack={() => setStep(6)} onNext={() => setStep(8)} nextDisabled={ownerGuardrailBlocked} />
           </section>
         )}
 
-        {step === 9 && (
+        {step === 8 && (
           <section>
             <p className="mb-4 text-sm text-slate-600">
-              The other half of S1 — bulk-create CRM records for leads that already exist in the
-              campaigns selected in step 3, independent of any reply or activity. Separate from
-              writeback, which only reacts to new events going forward.
+              The other half of S1 — bulk-creates CRM records for leads that already exist in
+              Smartlead, independent of any reply or activity. Runs as a real background job, so a
+              whole campaign gets scanned even if it takes a while — safe to leave this page once
+              it&apos;s started.
             </p>
-            {selectedCampaignIds.length === 0 ? (
-              <p className="rounded-lg border border-dashed border-slate-300 p-4 text-sm text-slate-500">
-                No campaigns were selected in step 3 — go back and select at least one to deliver
-                leads from.
-              </p>
-            ) : (
-              <>
-                <label className="block text-sm font-medium text-slate-700">
-                  Max leads per campaign (safety cap)
-                </label>
-                <input
-                  type="number"
-                  min={1}
-                  max={500}
-                  className={`mt-2 w-40 ${inputClass}`}
-                  value={deliveryMaxLeads}
-                  onChange={(e) => setDeliveryMaxLeads(Math.min(500, Math.max(1, Number(e.target.value) || 1)))}
-                />
-                <p className="mt-1 text-xs text-slate-500">
-                  Paginates across multiple Smartlead pages automatically, up to a hard ceiling of
-                  500 leads per run. Delivering a whole larger campaign at once needs a real background job runner,
-                  not built in this skeleton — this cap keeps a single request bounded.
+            {(() => {
+              const targets = deliveryCampaignIds();
+              return targets.length === 0 ? (
+                <p className="rounded-lg border border-dashed border-slate-300 p-4 text-sm text-slate-500">
+                  No campaigns to deliver from yet — none are currently active on this client&apos;s
+                  Smartlead account.
                 </p>
-                <button
-                  onClick={runDelivery}
-                  disabled={delivering}
-                  className="mt-4 rounded-lg bg-cymate-orange px-4 py-2 text-sm font-semibold text-white shadow-sm transition hover:bg-cymate-orange-dark disabled:opacity-50"
-                >
-                  {delivering
-                    ? 'Delivering…'
-                    : `Deliver leads from ${selectedCampaignIds.length} campaign${selectedCampaignIds.length === 1 ? '' : 's'}`}
-                </button>
+              ) : (
+                <>
+                  <p className="text-sm text-slate-600">
+                    Will deliver from <b className="text-cymate-navy">{targets.length}</b> campaign
+                    {targets.length === 1 ? '' : 's'}
+                    {syncScope !== 'specific_campaigns' ? ' (every currently-active campaign)' : ''}.
+                  </p>
+                  <button
+                    onClick={startDelivery}
+                    disabled={delivering}
+                    className="mt-4 rounded-lg bg-cymate-orange px-4 py-2 text-sm font-semibold text-white shadow-sm transition hover:bg-cymate-orange-dark disabled:opacity-50"
+                  >
+                    {delivering ? 'Delivering…' : `Deliver leads from ${targets.length} campaign${targets.length === 1 ? '' : 's'}`}
+                  </button>
 
-                {deliveryResults.length > 0 && (
-                  <div className="mt-4 space-y-2">
-                    {deliveryResults.map((r) => (
-                      <div key={r.campaignId} className="rounded-lg border border-slate-200 p-3 text-sm">
-                        <p className="font-medium text-cymate-navy">Campaign {r.campaignId}</p>
-                        {r.error ? (
-                          <p className="mt-1 text-rose-700">{r.error}</p>
-                        ) : r.result ? (
-                          <div className="mt-1 text-slate-600">
-                            <p>
-                              {r.result.created} created · {r.result.alreadyExisted} already existed ·{' '}
-                              {r.result.activitiesLogged} activities logged · {r.result.errors.length} errors
-                              {r.result.cappedAt
-                                ? ` · capped at ${r.result.cappedAt} of ${r.result.totalLeadsInCampaign} total leads`
-                                : ''}
-                            </p>
-                            {r.result.errors.length > 0 && (
-                              <ul className="mt-1 list-inside list-disc text-xs text-rose-700">
-                                {r.result.errors.map((e) => (
-                                  <li key={e.email}>
-                                    {e.email}: {e.reason}
-                                  </li>
-                                ))}
-                              </ul>
-                            )}
-                          </div>
-                        ) : null}
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </>
-            )}
+                  {deliveryError && (
+                    <p className="mt-3 rounded-lg bg-rose-50 p-3 text-sm text-rose-700 ring-1 ring-inset ring-rose-200">
+                      {deliveryError}
+                    </p>
+                  )}
+
+                  {deliveryJobs.length > 0 && (
+                    <div className="mt-4 space-y-2">
+                      {deliveryJobs.map((j) => (
+                        <div key={j.id} className="rounded-lg border border-slate-200 p-3 text-sm">
+                          <p className="flex items-center justify-between font-medium text-cymate-navy">
+                            <span>Campaign {j.campaignId}</span>
+                            <span
+                              className={`rounded-full px-2 py-0.5 text-[11px] font-semibold uppercase ${
+                                j.status === 'completed'
+                                  ? 'bg-emerald-50 text-emerald-700'
+                                  : j.status === 'failed'
+                                    ? 'bg-rose-50 text-rose-700'
+                                    : 'bg-cymate-cyan/10 text-cymate-navy'
+                              }`}
+                            >
+                              {j.status}
+                            </span>
+                          </p>
+                          <p className="mt-1 text-slate-600">
+                            {j.created} created · {j.alreadyExisted} already existed ·{' '}
+                            {j.skippedNotInterested} skipped (not interested) · {j.activitiesLogged}{' '}
+                            activities logged · {j.errors.length} errors
+                            {j.totalLeadsInCampaign ? ` · ${j.totalLeadsInCampaign} leads in campaign` : ''}
+                          </p>
+                          {j.errors.length > 0 && (
+                            <ul className="mt-1 list-inside list-disc text-xs text-rose-700">
+                              {j.errors.slice(0, 5).map((e) => (
+                                <li key={e.email}>
+                                  {e.email}: {e.reason}
+                                </li>
+                              ))}
+                            </ul>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </>
+              );
+            })()}
             <NavButtons
-              onBack={() => setStep(8)}
+              onBack={() => setStep(7)}
               onNext={() => {
                 loadCategories();
-                setStep(10);
+                setStep(9);
               }}
             />
           </section>
         )}
 
-        {step === 10 && (
+        {step === 9 && (
           <section>
             {categoriesWarning && (
               <p className="mb-4 rounded-lg bg-amber-50 p-3 text-sm text-amber-800 ring-1 ring-inset ring-amber-200">
@@ -738,50 +1022,29 @@ export default function SetupWizard() {
                   </div>
                 ))}
             </div>
-            <NavButtons onBack={() => setStep(9)} onNext={() => setStep(11)} />
+            <NavButtons onBack={() => setStep(8)} onNext={() => setStep(10)} />
           </section>
         )}
 
-        {step === 11 && (
+        {step === 10 && (
           <section className="space-y-4 text-sm">
-            <label className="flex items-center gap-2.5">
-              <input
-                type="checkbox"
-                className="h-4 w-4 accent-cymate-orange"
-                checked={createRecordOnInterestedReply}
-                onChange={(e) => setCreateRecordOnInterestedReply(e.target.checked)}
-              />
-              Create a record on interested reply
-            </label>
-            <label className="flex items-center gap-2.5">
-              <input
-                type="checkbox"
-                className="h-4 w-4 accent-cymate-orange"
-                checked={createRecordForAllLeads}
-                onChange={(e) => setCreateRecordForAllLeads(e.target.checked)}
-                disabled={mode !== 'full'}
-              />
-              Create a record for all leads (full mode only)
-            </label>
-            <label className="flex items-center gap-2.5">
-              <input
-                type="checkbox"
-                className="h-4 w-4 accent-cymate-orange"
-                checked={createDeal}
-                onChange={(e) => {
-                  setCreateDeal(e.target.checked);
-                  if (e.target.checked && dealStages.length === 0 && !dealStagesWarning) {
-                    loadDealStages();
-                  }
-                }}
-              />
-              Create a deal on positive reply / meeting booked
-            </label>
+            <p className="rounded-lg bg-slate-50 p-3 text-slate-600">
+              Record type was already decided in step 3:{' '}
+              <b className="text-cymate-navy">{createDeal ? 'Contact + Deal' : 'Contact only'}</b>.
+            </p>
             {createDeal && (
               <div>
                 <label className="mb-1 block text-xs font-medium text-slate-500">
                   Deal stage on create
                 </label>
+                {dealStages.length === 0 && !dealStagesWarning && (
+                  <button
+                    onClick={loadDealStages}
+                    className="mb-2 rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-medium text-slate-700 transition hover:bg-slate-50"
+                  >
+                    Load pipeline stages
+                  </button>
+                )}
                 {dealStagesWarning && (
                   <p className="mb-2 rounded-lg bg-amber-50 p-3 text-sm text-amber-800 ring-1 ring-inset ring-amber-200">
                     Couldn&apos;t fetch real stages from {crmType} ({dealStagesWarning}). Enter the
@@ -820,21 +1083,20 @@ export default function SetupWizard() {
                   onChange={(e) => setPlanLimitAcknowledged(e.target.checked)}
                 />
                 <span className="text-cymate-navy">
-                  Confirm this client&apos;s CRM plan supports the contact volume that Full mode will
-                  create. HubSpot and similar CRMs bill per marketing contact — Full mode writes
-                  every lead.
+                  Confirm this client&apos;s CRM plan supports the contact volume that syncing all
+                  contacts will create. HubSpot and similar CRMs bill per marketing contact.
                 </span>
               </label>
             )}
             <NavButtons
-              onBack={() => setStep(10)}
-              onNext={() => setStep(12)}
+              onBack={() => setStep(9)}
+              onNext={() => setStep(11)}
               nextDisabled={mode === 'full' && !planLimitAcknowledged}
             />
           </section>
         )}
 
-        {step === 12 && (
+        {step === 11 && (
           <section>
             <dl className="grid grid-cols-2 gap-3 rounded-lg border border-slate-100 bg-slate-50/60 p-4 text-sm sm:grid-cols-3">
               <div>
@@ -842,16 +1104,28 @@ export default function SetupWizard() {
                 <dd className="mt-0.5 font-medium text-cymate-navy">{selectedClient?.clientName}</dd>
               </div>
               <div>
-                <dt className="text-xs font-medium uppercase tracking-wide text-slate-400">Campaigns</dt>
-                <dd className="mt-0.5 font-medium text-cymate-navy">{selectedCampaignIds.length}</dd>
+                <dt className="text-xs font-medium uppercase tracking-wide text-slate-400">Sync scope</dt>
+                <dd className="mt-0.5 font-medium text-cymate-navy">
+                  {syncScope === 'positive_replies_only'
+                    ? 'Positive replies only'
+                    : syncScope === 'all_contacts'
+                      ? 'All contacts'
+                      : `${selectedCampaignIds.length} specific campaign${selectedCampaignIds.length === 1 ? '' : 's'}`}
+                </dd>
               </div>
               <div>
-                <dt className="text-xs font-medium uppercase tracking-wide text-slate-400">Mode</dt>
-                <dd className="mt-0.5 font-medium capitalize text-cymate-navy">{mode}</dd>
+                <dt className="text-xs font-medium uppercase tracking-wide text-slate-400">Record type</dt>
+                <dd className="mt-0.5 font-medium text-cymate-navy">{createDeal ? 'Contact + Deal' : 'Contact only'}</dd>
               </div>
               <div>
                 <dt className="text-xs font-medium uppercase tracking-wide text-slate-400">CRM</dt>
                 <dd className="mt-0.5 font-medium capitalize text-cymate-navy">{crmType}</dd>
+              </div>
+              <div>
+                <dt className="text-xs font-medium uppercase tracking-wide text-slate-400">{ownerLabel}</dt>
+                <dd className="mt-0.5 font-medium text-cymate-navy">
+                  {owners.find((o) => o.id === ownerId)?.label ?? '(none)'}
+                </dd>
               </div>
               <div>
                 <dt className="text-xs font-medium uppercase tracking-wide text-slate-400">Field mappings</dt>
@@ -863,16 +1137,16 @@ export default function SetupWizard() {
               </div>
             </dl>
 
-            {selectedCampaignIds.length === 0 && (
-              <p className="mt-4 rounded-lg bg-amber-50 p-3 text-sm text-amber-800 ring-1 ring-inset ring-amber-200">
-                No campaigns selected — webhook registration will fail until at least one is chosen
-                back in step 3.
+            {ownerGuardrailBlocked && (
+              <p className="mt-4 rounded-lg bg-rose-50 p-3 text-sm text-rose-700 ring-1 ring-inset ring-rose-200">
+                No owner was selected in step 7 — go back and pick one before building. Records will
+                not be created without an owner.
               </p>
             )}
 
             <button
               onClick={runBuild}
-              disabled={building}
+              disabled={building || ownerGuardrailBlocked}
               className="mt-6 rounded-lg bg-cymate-orange px-5 py-2.5 text-sm font-semibold text-white shadow-sm transition hover:bg-cymate-orange-dark disabled:opacity-50"
             >
               {building ? 'Building…' : 'Write config, register webhooks, fire test event'}
@@ -894,7 +1168,7 @@ export default function SetupWizard() {
               </a>{' '}
               to confirm the test event landed correctly.
             </p>
-            <NavButtons onBack={() => setStep(11)} onNext={() => {}} nextDisabled />
+            <NavButtons onBack={() => setStep(10)} onNext={() => {}} nextDisabled />
           </section>
         )}
       </div>
