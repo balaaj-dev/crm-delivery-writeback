@@ -36,6 +36,32 @@ import { SMARTLEAD_EVENT_TYPES } from './smartlead';
 
 const SMARTLEAD_API_BASE = 'https://server.smartlead.ai/api/v1';
 
+/**
+ * Retry-with-backoff on 429, added 26 Aug 2026 after a real failure: running
+ * several delivery jobs concurrently against the same client (one per
+ * active campaign, as "sync all contacts"/"positive replies only" both do)
+ * legitimately exceeds Smartlead's real account-wide limit — confirmed
+ * live: "Account rate limit exceeded. You have exceeded the 200 requests
+ * in 1 min limit." Every call in this file went straight through a bare
+ * `fetch`, so a single 429 killed the whole job outright, discarding real
+ * progress (the pagination call sits outside any per-lead try/catch).
+ * Three retries with growing delays is enough to ride out a shared,
+ * per-minute account limit when multiple jobs are contending for it —
+ * deliberately simple, same "not a full backoff system" scope as
+ * hubspotFetch's single 429 retry, just sized for an account-wide limit
+ * instead of a per-request one.
+ */
+async function smartleadFetch(url: URL, attempt = 1): Promise<Response> {
+  const res = await smartleadFetch(url);
+  if (res.status === 429 && attempt <= 3) {
+    const delayMs = attempt * 3000;
+    logger.warn('smartlead: rate limited, retrying with backoff', { attempt, delayMs, path: url.pathname });
+    await new Promise((resolve) => setTimeout(resolve, delayMs));
+    return smartleadFetch(url, attempt + 1);
+  }
+  return res;
+}
+
 export interface SmartleadLeadCategory {
   id: string | number;
   name: string;
@@ -59,7 +85,7 @@ export async function listCampaigns(apiKey: string): Promise<SmartleadCampaign[]
   const url = new URL(`${SMARTLEAD_API_BASE}/campaigns/`);
   url.searchParams.set('api_key', apiKey);
 
-  const res = await fetch(url);
+  const res = await smartleadFetch(url);
   if (!res.ok) {
     throw new Error(`Smartlead list-campaigns call failed (${res.status}): ${await res.text()}`);
   }
@@ -105,7 +131,7 @@ export async function listCampaignLeads(
   url.searchParams.set('offset', String(offset));
   url.searchParams.set('limit', String(limit));
 
-  const res = await fetch(url);
+  const res = await smartleadFetch(url);
   if (!res.ok) {
     throw new Error(`Smartlead list-campaign-leads call failed (${res.status}): ${await res.text()}`);
   }
@@ -187,7 +213,7 @@ export async function listLeadMessageHistory(
   const url = new URL(`${SMARTLEAD_API_BASE}/campaigns/${campaignId}/leads/${leadId}/message-history`);
   url.searchParams.set('api_key', apiKey);
 
-  const res = await fetch(url);
+  const res = await smartleadFetch(url);
   if (!res.ok) {
     throw new Error(`Smartlead message-history call failed (${res.status}): ${await res.text()}`);
   }
@@ -205,7 +231,7 @@ export async function listLeadCategories(apiKey: string): Promise<SmartleadLeadC
   const url = new URL(`${SMARTLEAD_API_BASE}/leads/fetch-categories`);
   url.searchParams.set('api_key', apiKey);
 
-  const res = await fetch(url);
+  const res = await smartleadFetch(url);
   if (!res.ok) {
     throw new Error(
       `[VERIFY] Smartlead fetch-categories call failed (${res.status}). This endpoint path is ` +

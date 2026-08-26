@@ -52,6 +52,7 @@ interface DeliveryJobView {
   skippedNotInterested: number;
   totalLeadsInCampaign?: number;
   errors: Array<{ email: string; reason: string }>;
+  failureReason?: string;
 }
 
 function maskSecret(value: string | undefined): string {
@@ -434,6 +435,8 @@ export default function SetupWizard() {
     };
   }
 
+  const [deliveryJobIds, setDeliveryJobIds] = useState<string[]>([]);
+
   async function pollDeliveryJobs(jobIds: string[]) {
     pollingRef.current = true;
     while (pollingRef.current) {
@@ -488,6 +491,7 @@ export default function SetupWizard() {
         ),
       );
       const jobIds = started.map((s) => s.job?.id).filter(Boolean) as string[];
+      setDeliveryJobIds(jobIds);
       if (jobIds.length === 0) {
         setDeliveryError('Could not start any delivery jobs — see the errors below.');
         setDelivering(false);
@@ -505,6 +509,25 @@ export default function SetupWizard() {
       pollingRef.current = false;
     };
   }, []);
+
+  /**
+   * A job that hit a transient failure (e.g. Smartlead's account-wide rate
+   * limit under several concurrent jobs — a real case, not hypothetical)
+   * still has real progress saved at job.offset. Resuming continues from
+   * there via lib/jobs.ts's own resume support, instead of rescanning a
+   * campaign from the start.
+   */
+  async function resumeJob(jobId: string) {
+    setDeliveryError(null);
+    setDelivering(true);
+    try {
+      await fetch(`/api/delivery/jobs/${jobId}/resume`, { method: 'POST' });
+      pollDeliveryJobs(deliveryJobIds.length > 0 ? deliveryJobIds : [jobId]);
+    } catch (err) {
+      setDeliveryError(err instanceof Error ? err.message : String(err));
+      setDelivering(false);
+    }
+  }
 
   async function runBuild() {
     setBuilding(true);
@@ -1114,6 +1137,21 @@ export default function SetupWizard() {
                                 </li>
                               ))}
                             </ul>
+                          )}
+                          {j.status === 'failed' && (
+                            <div className="mt-2 flex items-center justify-between gap-3 rounded-lg bg-rose-50 p-2">
+                              <p className="text-xs text-rose-700">
+                                {j.failureReason ?? 'Stopped unexpectedly.'} Progress up to this point is
+                                saved — resuming continues from here, not from the start.
+                              </p>
+                              <button
+                                onClick={() => resumeJob(j.id)}
+                                disabled={delivering}
+                                className="flex-none rounded-lg border border-rose-300 bg-white px-3 py-1 text-xs font-semibold text-rose-700 transition hover:bg-rose-100 disabled:opacity-50"
+                              >
+                                Resume
+                              </button>
+                            </div>
                           )}
                         </div>
                       ))}
