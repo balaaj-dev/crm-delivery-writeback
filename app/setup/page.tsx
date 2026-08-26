@@ -34,8 +34,8 @@ const STEP_TITLES = [
   'CRM credentials',
   'Field mapping',
   'Status mapping',
-  'Deliver contacts',
   'Record behaviour',
+  'Deliver contacts',
   'Review and build',
 ];
 
@@ -1082,6 +1082,81 @@ export default function SetupWizard() {
         )}
 
         {step === 9 && (
+          <section className="space-y-4 text-sm">
+            <p className="rounded-lg bg-slate-50 p-3 text-slate-600">
+              Record type was already decided in step 3:{' '}
+              <b className="text-cymate-navy">{createDeal ? 'Contact + Deal' : 'Contact only'}</b>.
+            </p>
+            {createDeal && (
+              <div>
+                <label className="mb-1 block text-xs font-medium text-slate-500">
+                  Deal stage on create
+                </label>
+                <p className="mb-2 text-xs text-slate-500">
+                  This choice matters before the next step — Deliver contacts creates a deal for
+                  every genuinely interested lead it delivers, and it uses whatever stage is set
+                  here at the time.
+                </p>
+                {dealStages.length === 0 && !dealStagesWarning && (
+                  <button
+                    onClick={loadDealStages}
+                    className="mb-2 rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-medium text-slate-700 transition hover:bg-slate-50"
+                  >
+                    Load pipeline stages
+                  </button>
+                )}
+                {dealStagesWarning && (
+                  <p className="mb-2 rounded-lg bg-amber-50 p-3 text-sm text-amber-800 ring-1 ring-inset ring-amber-200">
+                    Couldn&apos;t fetch real stages from {crmType} ({dealStagesWarning}). Enter the
+                    stage ID manually, or leave blank to use the pipeline&apos;s default stage.
+                  </p>
+                )}
+                {dealStages.length > 0 ? (
+                  <select
+                    className={inputClass}
+                    value={dealStageOnCreate}
+                    onChange={(e) => setDealStageOnCreate(e.target.value)}
+                  >
+                    <option value="">Use the pipeline&apos;s default stage</option>
+                    {dealStages.map((s) => (
+                      <option key={s.id} value={s.id}>
+                        {s.pipelineLabel} — {s.label}
+                      </option>
+                    ))}
+                  </select>
+                ) : (
+                  <input
+                    className={inputClass}
+                    placeholder="Deal stage ID (optional — leave blank for the pipeline default)"
+                    value={dealStageOnCreate}
+                    onChange={(e) => setDealStageOnCreate(e.target.value)}
+                  />
+                )}
+              </div>
+            )}
+            {mode === 'full' && (
+              <label className="flex items-start gap-2.5 rounded-xl border border-cymate-orange/30 bg-cymate-orange/5 p-3">
+                <input
+                  type="checkbox"
+                  className="mt-1 h-4 w-4 accent-cymate-orange"
+                  checked={planLimitAcknowledged}
+                  onChange={(e) => setPlanLimitAcknowledged(e.target.checked)}
+                />
+                <span className="text-cymate-navy">
+                  Confirm this client&apos;s CRM plan supports the contact volume that syncing all
+                  contacts will create. HubSpot and similar CRMs bill per marketing contact.
+                </span>
+              </label>
+            )}
+            <NavButtons
+              onBack={() => setStep(8)}
+              onNext={() => setStep(10)}
+              nextDisabled={mode === 'full' && !planLimitAcknowledged}
+            />
+          </section>
+        )}
+
+        {step === 10 && (
           <section>
             <p className="mb-4 text-sm text-slate-600">
               The other half of S1 — bulk-creates CRM records for leads that already exist in
@@ -1172,77 +1247,7 @@ export default function SetupWizard() {
                 </>
               );
             })()}
-            <NavButtons onBack={() => setStep(8)} onNext={() => setStep(10)} />
-          </section>
-        )}
-
-        {step === 10 && (
-          <section className="space-y-4 text-sm">
-            <p className="rounded-lg bg-slate-50 p-3 text-slate-600">
-              Record type was already decided in step 3:{' '}
-              <b className="text-cymate-navy">{createDeal ? 'Contact + Deal' : 'Contact only'}</b>.
-            </p>
-            {createDeal && (
-              <div>
-                <label className="mb-1 block text-xs font-medium text-slate-500">
-                  Deal stage on create
-                </label>
-                {dealStages.length === 0 && !dealStagesWarning && (
-                  <button
-                    onClick={loadDealStages}
-                    className="mb-2 rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-medium text-slate-700 transition hover:bg-slate-50"
-                  >
-                    Load pipeline stages
-                  </button>
-                )}
-                {dealStagesWarning && (
-                  <p className="mb-2 rounded-lg bg-amber-50 p-3 text-sm text-amber-800 ring-1 ring-inset ring-amber-200">
-                    Couldn&apos;t fetch real stages from {crmType} ({dealStagesWarning}). Enter the
-                    stage ID manually, or leave blank to use the pipeline&apos;s default stage.
-                  </p>
-                )}
-                {dealStages.length > 0 ? (
-                  <select
-                    className={inputClass}
-                    value={dealStageOnCreate}
-                    onChange={(e) => setDealStageOnCreate(e.target.value)}
-                  >
-                    <option value="">Use the pipeline&apos;s default stage</option>
-                    {dealStages.map((s) => (
-                      <option key={s.id} value={s.id}>
-                        {s.pipelineLabel} — {s.label}
-                      </option>
-                    ))}
-                  </select>
-                ) : (
-                  <input
-                    className={inputClass}
-                    placeholder="Deal stage ID (optional — leave blank for the pipeline default)"
-                    value={dealStageOnCreate}
-                    onChange={(e) => setDealStageOnCreate(e.target.value)}
-                  />
-                )}
-              </div>
-            )}
-            {mode === 'full' && (
-              <label className="flex items-start gap-2.5 rounded-xl border border-cymate-orange/30 bg-cymate-orange/5 p-3">
-                <input
-                  type="checkbox"
-                  className="mt-1 h-4 w-4 accent-cymate-orange"
-                  checked={planLimitAcknowledged}
-                  onChange={(e) => setPlanLimitAcknowledged(e.target.checked)}
-                />
-                <span className="text-cymate-navy">
-                  Confirm this client&apos;s CRM plan supports the contact volume that syncing all
-                  contacts will create. HubSpot and similar CRMs bill per marketing contact.
-                </span>
-              </label>
-            )}
-            <NavButtons
-              onBack={() => setStep(9)}
-              onNext={() => setStep(11)}
-              nextDisabled={mode === 'full' && !planLimitAcknowledged}
-            />
+            <NavButtons onBack={() => setStep(9)} onNext={() => setStep(11)} />
           </section>
         )}
 
