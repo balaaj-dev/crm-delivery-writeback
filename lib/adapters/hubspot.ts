@@ -105,11 +105,22 @@ function isDryRun(): boolean {
  * requires that "the log shows the exact HubSpot calls that would be made
  * for each event type" — a generic CRM-agnostic mock cannot produce that.
  * So DRY_RUN is intercepted here, at the HTTP layer, inside the real
- * HubSpot adapter: every call this adapter would make is logged with its
+ * HubSpot adapter: every *write* this adapter would make is logged with its
  * method, path, and body, and a synthetic 200 response is returned so the
- * calling method's parsing logic still runs — but no request ever reaches
+ * calling method's parsing logic still runs — but no write ever reaches
  * HubSpot. The generic mock adapter remains the fixture used directly by
  * dispatch's own unit tests (Milestone 3), independent of any real CRM.
+ *
+ * GET requests are deliberately NOT simulated (see hubspotFetch below) —
+ * fixed 26 Aug 2026 after two independent live testers hit the same real
+ * bug: with DRY_RUN=true (the safe default this app runs with normally),
+ * every read-only lookup the wizard needs — describeFields, listOwners,
+ * listDealStages, even testConnection's own credential check — came back
+ * empty, because they were being simulated exactly like a write. That's not
+ * just an annoyance: testConnection reporting a false "Connected to
+ * HubSpot" for a bad token, purely because DRY_RUN happened to be on, is a
+ * real correctness bug. None of these calls mutate anything in HubSpot, so
+ * there is no dry-run reason to fake them — only writes need faking.
  */
 async function simulatedResponse(method: string, path: string, body: unknown): Promise<Response> {
   logger.info('hubspot dry-run: intended call', { dryRun: true, method, path, body });
@@ -143,8 +154,11 @@ async function hubspotFetch(
   init: RequestInit = {},
   attempt = 1,
 ): Promise<Response> {
-  if (isDryRun()) {
-    return simulatedResponse(init.method ?? 'GET', path, init.body ? JSON.parse(String(init.body)) : undefined);
+  const method = (init.method ?? 'GET').toUpperCase();
+  // Only writes get simulated under DRY_RUN — see the comment above
+  // simulatedResponse for why GETs always execute for real.
+  if (isDryRun() && method !== 'GET') {
+    return simulatedResponse(method, path, init.body ? JSON.parse(String(init.body)) : undefined);
   }
 
   const res = await fetch(`${HUBSPOT_API_BASE}${path}`, {
