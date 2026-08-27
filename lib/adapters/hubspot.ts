@@ -257,21 +257,66 @@ function buildContactProperties(event: CanonicalEvent, cfg: ClientConfig): Recor
 }
 
 /**
+ * Search (not GET-by-idProperty) for a company by domain. Confirmed live
+ * companies scope on 27 Aug 2026: company find/create both work. Uses
+ * `POST /crm/v3/objects/companies/search`, not the simpler
+ * `GET /crm/v3/objects/companies/{domain}?idProperty=domain` — found live
+ * that HubSpot appears to auto-create its own company the instant a
+ * contact's `website` property is set (a native HubSpot behavior,
+ * independent of this adapter), and that auto-created company is
+ * consistently invisible to the idProperty GET even several seconds later,
+ * but *is* visible to search within a few seconds. Using GET here would
+ * mean this adapter never sees HubSpot's own auto-created company and
+ * creates a duplicate on every new contact with a domain.
+ */
+async function findCompanyByDomain(
+  cfg: ClientConfig,
+  domain: string,
+): Promise<{ id: string; name: string | null } | null> {
+  const res = await hubspotFetch(cfg, '/crm/v3/objects/companies/search', {
+    method: 'POST',
+    body: JSON.stringify({
+      filterGroups: [{ filters: [{ propertyName: 'domain', operator: 'EQ', value: domain }] }],
+      properties: ['domain', 'name'],
+      limit: 1,
+    }),
+  });
+  if (!res.ok) {
+    throw new HubspotApiError(
+      res.status,
+      `HubSpot company search failed: ${hubspotErrorSummary(await res.text())}`,
+    );
+  }
+  const body = (await res.json()) as { results: Array<{ id: string; properties: { name: string | null } }> };
+  const match = body.results[0];
+  return match ? { id: match.id, name: match.properties.name } : null;
+}
+
+/**
  * Find-or-create the prospect's company by domain and associate it with a
  * contact or deal. Added 27 Aug 2026 per Jairo/Balaaj feedback: deals moved
  * to Interested had no company record attached in HubSpot.
  *
- * [VERIFY-once-scoped]: `GET /crm/v3/objects/companies/{domain}?idProperty=domain`
- * confirmed live to be a real, recognized route — it returns a
- * MISSING_SCOPES error naming `crm.objects.companies.read` (403, not 404),
- * which HubSpot only does for routes it recognizes. The access token in use
- * this session does not have that scope (or the `.write` counterpart needed
- * to create one), so the create/search calls below are unverified against a
- * live portal — add `crm.objects.companies.read` and
- * `crm.objects.companies.write` to the Private App/Service Key before
- * trusting this path. Returns null (logs a warning) rather than throwing on
- * a missing-scope or any other failure, so a company-record gap never blocks
- * the contact/deal write it's attached to.
+ * Retries the search up to twice, 3s apart, before creating — see
+ * findCompanyByDomain's comment. HubSpot's own auto-created company
+ * (triggered by the contact write that happens right before this runs)
+ * isn't always searchable yet on the first attempt, and the delay isn't
+ * fixed: confirmed live across several real test contacts, the auto-created
+ * company became searchable anywhere from ~3s to ~3.5s after contact
+ * creation — a single 2s retry wasn't consistently enough and still
+ * produced a duplicate. Two retries costs up to ~6s of extra latency, but
+ * only for a brand-new domain this adapter hasn't seen before; an
+ * already-known domain resolves on the first, immediate search.
+ *
+ * When an existing company is found with no name (HubSpot's own
+ * auto-created company never sets one — confirmed live, always `name:
+ * null`), patches in the real company name if one is available, rather than
+ * leaving a nameless company in the portal just because we didn't have to
+ * create it ourselves.
+ *
+ * Fails soft — logs a warning and returns null rather than throwing on any
+ * failure, so a company-record gap never blocks the contact/deal write it's
+ * attached to.
  */
 async function findOrCreateCompany(
   cfg: ClientConfig,
@@ -280,19 +325,31 @@ async function findOrCreateCompany(
 ): Promise<string | null> {
   if (!domain) return null;
 
-  const findRes = await hubspotFetch(
-    cfg,
-    `/crm/v3/objects/companies/${encodeURIComponent(domain)}?idProperty=domain`,
-  );
-  if (findRes.ok) {
-    const body = (await findRes.json()) as { id: string };
-    return body.id;
-  }
-  if (findRes.status !== 404) {
+  try {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      if (attempt > 0) await new Promise((resolve) => setTimeout(resolve, 3000));
+      const existing = await findCompanyByDomain(cfg, domain);
+      if (existing) {
+        if (!existing.name && companyName) {
+          const patchRes = await hubspotFetch(cfg, `/crm/v3/objects/companies/${existing.id}`, {
+            method: 'PATCH',
+            body: JSON.stringify({ properties: { name: companyName } }),
+          });
+          if (!patchRes.ok) {
+            logger.warn('hubspot: failed to name an existing nameless company', {
+              companyId: existing.id,
+              status: patchRes.status,
+              detail: hubspotErrorSummary(await patchRes.text()),
+            });
+          }
+        }
+        return existing.id;
+      }
+    }
+  } catch (err) {
     logger.warn('hubspot: findOrCreateCompany lookup failed, skipping company association', {
       domain,
-      status: findRes.status,
-      detail: hubspotErrorSummary(await findRes.text()),
+      error: err instanceof Error ? err.message : err,
     });
     return null;
   }

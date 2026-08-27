@@ -308,18 +308,21 @@ deployment needed. Three requests against a real Outspeak/HubSpot portal (cleane
    to create the deal before writing activity (step 7, was step 9) — confirmed live afterward:
    `deal_to_note` associations present on all three test deals.
 
-**New, still-open finding**: on all three test runs, HubSpot ended up with **two companies** for the
-same domain — one correctly named (ours, from `findOrCreateCompany`), one with `name: null` created
-roughly a second earlier. This looks like HubSpot's own backend auto-creating a company the instant
-a contact's `website` property is set (independent of our API calls), racing our own
-`GET /crm/v3/objects/companies/{domain}?idProperty=domain` check — our GET runs before HubSpot's
-auto-created company is visible at that lookup, so we create a second one. The contact and deal
-still end up correctly associated with *our* company (not the auto-created shell), so data isn't
-wrong, just duplicated and slightly confusing in the UI. Not fixed in this pass — needs a decision
-on approach (a short retry/delay before the domain lookup; a `POST /crm/v3/objects/companies/search`
-call instead of the single-record GET; or a cleanup pass that finds and archives blank duplicate
-companies) rather than a guess. All test data (3 contacts, 6 companies, 3 deals, 3 notes) was
-deleted from the real portal after this test.
+**Update — fixed later the same day.** The duplicate-company finding above was real: HubSpot
+auto-creates its own company the instant a contact's `website` property is set, independent of our
+API calls, and that auto-created company was consistently invisible to
+`GET /crm/v3/objects/companies/{domain}?idProperty=domain` even several seconds later. Per Balaaj's
+direction, tried the search-based approach first: `POST /crm/v3/objects/companies/search` *does*
+see the auto-created company, but not immediately — confirmed live it became searchable anywhere
+from ~3s to ~3.5s after contact creation, so a single fixed retry wasn't reliable either (one test
+run still produced a duplicate on a 2s wait). Final fix in `lib/adapters/hubspot.ts`:
+`findOrCreateCompany` now searches (not GETs) up to 3 times, 3s apart, before creating — and when it
+finds an existing company with no name (HubSpot's auto-created one never has one), it PATCHes in the
+real name instead of leaving a nameless company just because we didn't have to create it ourselves.
+Confirmed live across two more full test runs: exactly one company each time, correctly named. Adds
+up to ~6s of latency, but only for a domain this adapter has never seen before — a repeat domain
+resolves on the first, immediate search. All test data across every run in this section (5 contacts,
+8 companies, 5 deals, 5 notes total) was created then deleted from the real portal.
 
 ## Unresolved [VERIFY] items — confirm against live vendor docs/accounts before DRY_RUN=false
 
