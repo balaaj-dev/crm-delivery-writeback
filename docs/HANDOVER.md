@@ -112,8 +112,7 @@ added afterward at Balaaj's request, once writeback was proven against a real Hu
   result into `source.campaignIds`. Falls back cleanly (no campaigns shown, Next stays enabled) if
   the fetch fails, same graceful-degradation pattern as the categories/fields steps.
 - **Config-source-agnostic session override for wizard-configured values** (`lib/config.ts`'s
-  `setSessionOverride`/`applySessionOverrides`, backed by a local JSON file at
-  `data/client-overrides.json`, gitignored). Fixes a real bug found live: neither
+  `setSessionOverride`/`applySessionOverrides`). Fixes a real bug found live: neither
   `fixtures/clients.json` (a static committed file) nor Airtable (write-back is a stub — see
   above) could actually persist what the wizard configures, so the wizard's own "fire a test
   event" step silently ran against stale data instead of what had just been selected — confirmed
@@ -121,14 +120,32 @@ added afterward at Balaaj's request, once writeback was proven against a real Hu
   in-memory `Map` and **did not work** — confirmed live that Next.js dev mode compiles different
   API route files as separate on-demand bundles, each getting its own independent instance of
   `lib/config.ts`'s top-level state, so a value set by the PUT route was invisible to
-  `/api/webhooks/smartlead`'s route. This isn't dev-mode-only either: Vercel typically runs each
-  API route as its own serverless function in production, so in-memory cross-route state would
-  fail there for the same underlying reason (separate execution contexts), just with a different
-  mechanism. The filesystem doesn't have this problem — any route reading/writing the same path
-  sees the same data. Same "doesn't survive Vercel's read-only fs" caveat as `lib/log.ts`'s file
-  mirror; this is a local-testing convenience, not a production persistence layer. **Takeaway for
-  anything added later that needs cross-route shared state in this codebase: do not use a bare
-  module-level variable — use the filesystem (locally) or a real store (in production).**
+  `/api/webhooks/smartlead`'s route. **Takeaway for anything added later that needs cross-route
+  shared state in this codebase: do not use a bare module-level variable — use the filesystem
+  (locally) or a real store (in production).**
+
+  The second fix attempt (a local JSON file at `data/client-overrides.json`) fixed local dev but
+  **confirmed live 27 Aug 2026 to silently fail on Vercel** — the write threw on the read-only
+  filesystem, was caught and logged at debug level (not surfaced), so `PUT
+  /api/clients/[id]/config` reported `ok: true` while nothing actually persisted. A client
+  activated through the wizard on Vercel was gone by the very next request; a real incoming
+  webhook would have found it `activated: false` and silently skipped every event. Confirmed via
+  the wizard's own step 11 build summary showing "Config not durably persisted" and the synthetic
+  test event correctly skipping with reason `not_activated`.
+
+  **Fixed for real 27 Aug 2026** by adding Upstash Redis (`lib/kv.ts`, via the Vercel↔Upstash
+  Marketplace integration, free tier) as the persistence backend when `KV_REST_API_URL`/
+  `KV_REST_API_TOKEN` are set (i.e. on Vercel with the integration connected), falling back to the
+  local JSON file when they aren't (i.e. local dev — unchanged, verified live). `lib/jobs.ts`'s
+  delivery-job records got the same fix in the same pass — its file-only version had no
+  fallback/catch at all (unlike `lib/config.ts`'s), so it threw outright on Vercel: "Could not
+  start any delivery jobs" for every campaign. Both now check `kvAvailable()` first.
+
+  This does **not** fix everything about background delivery jobs on Vercel — see `lib/jobs.ts`'s
+  file header for the separate, still-open problem: the in-process runner that keeps a job moving
+  forward isn't guaranteed to keep running once Vercel freezes the function instance that started
+  it. Job *records* now survive that; actually driving a large job to completion on serverless
+  still needs a queue or cron trigger, not built in this pass.
 
 ## Design decision: how DRY_RUN actually routes calls (deviates from a literal reading of brief §11)
 

@@ -7,22 +7,30 @@
  * "wait for the work", persists progress durably, and survives the
  * initiating request disconnecting.
  *
- * What this is, honestly: a job store backed by one JSON file per job
- * (data/jobs/<id>.json, gitignored — same durable-local-file pattern
- * already used for the event log and client-config overrides), plus an
- * in-process async runner that keeps working after the HTTP handler that
- * started it has already returned a response. This is genuinely correct
- * and resumable for any persistently-running Node process — `next dev`
- * locally, or `next start` on a normal always-on server. It is NOT
- * automatically correct on Vercel's default serverless functions
- * specifically: those are frozen/torn down shortly after a response is
- * sent, so a floating promise started inside a request handler is not
- * guaranteed to keep running. Deploying this piece to real serverless
- * needs one more real piece of infra to drive it forward — e.g. a Vercel
- * Cron job or a queue trigger (QStash, etc.) hitting a
- * "process the next chunk of this job" endpoint on an interval, rather
- * than relying on one long-lived in-memory loop. Documented here, not
- * silently assumed to work — see docs/HANDOVER.md.
+ * Job records: one per job, backed by Upstash Redis (lib/kv.ts) when
+ * available, falling back to one JSON file per job under data/jobs/ for
+ * local dev (unchanged from before). Switched to KV 27 Aug 2026 after
+ * confirming live that the file-only version threw outright on Vercel's
+ * read-only filesystem — "Could not start any delivery jobs" with every
+ * campaign failing. The file version had no fallback/catch at all, unlike
+ * lib/config.ts's session overrides, which is why this broke loudly while
+ * the rest of the wizard appeared to work.
+ *
+ * The runner itself — the in-process async loop that keeps working after
+ * the HTTP handler that started it has already returned a response — is a
+ * SEPARATE problem this change does not fix. That part is genuinely correct
+ * and resumable for any persistently-running Node process (`next dev`
+ * locally, or `next start` on a normal always-on server), but is NOT
+ * automatically correct on Vercel's default serverless functions: those are
+ * frozen/torn down shortly after a response is sent, so a floating promise
+ * started inside a request handler is not guaranteed to keep running to
+ * completion. Real job *records* now survive that (KV persists regardless
+ * of whether the runner got to finish), but actually driving a large job to
+ * completion on Vercel still needs one more real piece of infra — e.g. a
+ * Vercel Cron job or a queue trigger (QStash pairs naturally with the
+ * Upstash Redis already in use here) hitting a "process the next chunk of
+ * this job" endpoint on an interval. Not built in this pass — see
+ * docs/HANDOVER.md.
  */
 import { readFile, writeFile, mkdir, readdir } from 'node:fs/promises';
 import path from 'node:path';
@@ -36,8 +44,10 @@ import {
 } from './sources/smartlead-api';
 import { logger, recordEvent } from './log';
 import { isDryRun } from './adapters/index';
+import { kvAvailable, kvGet, kvGetAllByPrefix, kvSet } from './kv';
 
 const JOBS_DIR = path.join(process.cwd(), 'data', 'jobs');
+const JOB_KV_PREFIX = 'delivery-job:';
 const PAGE_SIZE = 100;
 
 export type JobStatus = 'queued' | 'running' | 'completed' | 'failed' | 'paused';
@@ -74,11 +84,18 @@ function jobFilePath(id: string): string {
 
 async function saveJob(job: DeliveryJob): Promise<void> {
   job.updatedAt = new Date().toISOString();
+  if (kvAvailable()) {
+    await kvSet(`${JOB_KV_PREFIX}${job.id}`, job);
+    return;
+  }
   await mkdir(JOBS_DIR, { recursive: true });
   await writeFile(jobFilePath(job.id), JSON.stringify(job, null, 2), 'utf8');
 }
 
 export async function getJob(id: string): Promise<DeliveryJob | null> {
+  if (kvAvailable()) {
+    return kvGet<DeliveryJob>(`${JOB_KV_PREFIX}${id}`);
+  }
   try {
     const raw = await readFile(jobFilePath(id), 'utf8');
     return JSON.parse(raw) as DeliveryJob;
@@ -88,6 +105,12 @@ export async function getJob(id: string): Promise<DeliveryJob | null> {
 }
 
 export async function listJobs(clientId?: string): Promise<DeliveryJob[]> {
+  if (kvAvailable()) {
+    const all = await kvGetAllByPrefix<DeliveryJob>(JOB_KV_PREFIX);
+    const jobs = Object.values(all);
+    const filtered = clientId ? jobs.filter((j) => j.clientId === clientId) : jobs;
+    return filtered.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  }
   try {
     const files = await readdir(JOBS_DIR);
     const jobs = await Promise.all(
