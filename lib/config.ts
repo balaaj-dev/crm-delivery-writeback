@@ -11,6 +11,7 @@ import { clientConfigSchema } from './schemas';
 import { listClientConfigsFromAirtable } from './airtable';
 import { logger } from './log';
 import { encryptRecord, decryptRecord } from './crypto';
+import { kvAvailable, kvGetAllByPrefix, kvSet } from './kv';
 
 export type ConfigSource = 'fixtures' | 'airtable';
 
@@ -60,24 +61,23 @@ async function loadFixtureClients(): Promise<ClientConfig[]> {
  * would run against stale data — confirmed live: a deal-stage choice made
  * in the wizard was completely ignored by the test event that followed it.
  *
- * This is backed by a local JSON file, not an in-memory Map — confirmed
- * live (25 Aug 2026) that an in-memory Map here does NOT reliably work:
- * Next.js dev mode compiles different API route files as separate on-demand
- * bundles, and each got its own independent instance of this module's
- * top-level state, so a Map set by the PUT route was invisible to
- * /api/webhooks/smartlead's route. A real production deployment would have
- * the same problem for a different reason — Vercel typically runs each API
- * route as its own serverless function, so in-memory state is never shared
- * across routes there either. The filesystem doesn't have that problem: any
- * route reading/writing the same path sees the same data. Same "resets on a
- * fresh checkout / doesn't survive Vercel's read-only fs" limitation as
- * lib/log.ts's file mirror — intentional, documented, not a production
- * persistence layer. Gitignored — see .gitignore's /data/ entry.
+ * Backed by Upstash Redis (lib/kv.ts) when available — added 27 Aug 2026
+ * after confirming live that the previous local-JSON-file version silently
+ * lost every override on Vercel (its own write failure was caught and
+ * logged, not surfaced, so PUT requests reported success while nothing
+ * actually persisted). Falls back to the local file when no KV store is
+ * connected (i.e. local dev — same behavior as before, unchanged) — see
+ * lib/kv.ts's header for why an in-memory Map doesn't work in either
+ * environment. Gitignored file path — see .gitignore's /data/ entry.
  */
 const OVERRIDES_FILE_PATH = path.join(process.cwd(), 'data', 'client-overrides.json');
+const CLIENT_OVERRIDE_KV_PREFIX = 'client-override:';
 
-/** Raw on-disk shape — credentials still encrypted. Never hand this to a caller directly. */
+/** Raw shape — credentials still encrypted. Never hand this to a caller directly. */
 async function readOverridesRaw(): Promise<Record<string, ClientConfig>> {
+  if (kvAvailable()) {
+    return kvGetAllByPrefix<ClientConfig>(CLIENT_OVERRIDE_KV_PREFIX);
+  }
   try {
     const raw = await readFile(OVERRIDES_FILE_PATH, 'utf8');
     return JSON.parse(raw) as Record<string, ClientConfig>;
@@ -95,23 +95,27 @@ async function readOverrides(): Promise<Record<string, ClientConfig>> {
   return overrides;
 }
 
-/**
- * Encrypts crm.credentials before it ever touches disk (lib/crypto.ts).
- * Reads the RAW (still-encrypted) file first, not the decrypted view —
- * otherwise every other client's already-encrypted credentials would get
- * silently rewritten as plaintext just because one client's config changed.
- */
+/** Encrypts crm.credentials before it ever touches KV or disk (lib/crypto.ts). */
 export async function setSessionOverride(config: ClientConfig): Promise<void> {
+  const encrypted: ClientConfig = {
+    ...config,
+    crm: { ...config.crm, credentials: encryptRecord(config.crm.credentials) },
+  };
+
+  if (kvAvailable()) {
+    await kvSet(`${CLIENT_OVERRIDE_KV_PREFIX}${config.clientId}`, encrypted);
+    return;
+  }
+
   try {
+    // File path only: read-modify-write the whole blob, since one file holds
+    // every client. KV path above writes just this one key — no read needed.
     const overrides = await readOverridesRaw();
-    overrides[config.clientId] = {
-      ...config,
-      crm: { ...config.crm, credentials: encryptRecord(config.crm.credentials) },
-    };
+    overrides[config.clientId] = encrypted;
     await mkdir(path.dirname(OVERRIDES_FILE_PATH), { recursive: true });
     await writeFile(OVERRIDES_FILE_PATH, JSON.stringify(overrides, null, 2), 'utf8');
   } catch (err) {
-    // Read-only filesystem (e.g. Vercel) — same fallback as lib/log.ts.
+    // Read-only filesystem and no KV connected — same fallback as lib/log.ts.
     logger.debug('client-overrides file write skipped (read-only or unavailable fs)', {
       error: err instanceof Error ? err.message : String(err),
     });

@@ -13,6 +13,7 @@
     "test:watch": "vitest"
   },
   "dependencies": {
+    "@upstash/redis": "^1.38.3",
     "next": "14.2.35",
     "react": "18.3.1",
     "react-dom": "18.3.1",
