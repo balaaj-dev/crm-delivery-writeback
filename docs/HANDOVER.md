@@ -141,11 +141,39 @@ added afterward at Balaaj's request, once writeback was proven against a real Hu
   fallback/catch at all (unlike `lib/config.ts`'s), so it threw outright on Vercel: "Could not
   start any delivery jobs" for every campaign. Both now check `kvAvailable()` first.
 
-  This does **not** fix everything about background delivery jobs on Vercel — see `lib/jobs.ts`'s
-  file header for the separate, still-open problem: the in-process runner that keeps a job moving
-  forward isn't guaranteed to keep running once Vercel freezes the function instance that started
-  it. Job *records* now survive that; actually driving a large job to completion on serverless
-  still needs a queue or cron trigger, not built in this pass.
+  This did **not** fix everything about background delivery jobs on Vercel by itself — confirmed
+  live the same day: a job record persisted correctly, but sat at status `"queued"` with zero
+  progress indefinitely, because Vercel had already frozen the function instance that started it
+  before it processed anything.
+
+## Queue trigger for delivery jobs on Vercel (Upstash QStash, 27 Aug 2026)
+
+Fixes the gap immediately above. `lib/jobs.ts`'s single long `while` loop (`runJob`) was split into
+`processJobPage` — processes exactly one page of leads (`PAGE_SIZE`, reduced from 100 to 20 for
+serverless safety — see that constant's comment) and returns whether more work remains — plus a
+thin `runJob` wrapper that just loops `processJobPage` until done, unchanged behavior for local dev.
+
+New self-chaining path when QStash is configured (`lib/qstash.ts`, `qstashAvailable()`):
+`startDeliveryJob`/`resumeDeliveryJob` publish a "process this job" message to QStash instead of
+running the job in-process. A new route, `app/api/delivery/jobs/[id]/process/route.ts`, handles that
+message: verifies it really came from QStash (cryptographic signature, not Basic Auth — that route
+is deliberately excluded from `middleware.ts`'s auth gate, since QStash can't present one), calls
+`processJobPage` for one page, and — if there's more work — publishes the *next* chunk message back
+to QStash targeting the same route. QStash delivers that as a fresh HTTP request, which Vercel runs
+as a brand-new, un-frozen function instance. Repeats until the job reports no more work.
+
+Local dev is unchanged and reconfirmed live after this refactor: `QSTASH_TOKEN` isn't set locally,
+so `qstashAvailable()` is false, so `startDeliveryJob` falls through to the original in-process
+`runJob` loop — ran a real job against Outspeak's campaign 3845003 after the refactor, completed
+correctly (`status: "completed"`, same skip/create counts as before the change).
+
+**Not yet verified live**: the actual QStash path itself. Needs the Upstash QStash Marketplace
+integration connected on Vercel (same account as the Redis integration, separate connection step)
+before `QSTASH_TOKEN`/`QSTASH_CURRENT_SIGNING_KEY`/`QSTASH_NEXT_SIGNING_KEY` exist to test against —
+not connected as of this write-up. Once connected, verify by starting a real delivery job on the
+Vercel deployment and confirming it actually reaches `"completed"` (not stuck at `"queued"` or
+`"running"` the way the pre-fix job did) — same test used to confirm the persistence-only fix wasn't
+enough on its own.
 
 ## Design decision: how DRY_RUN actually routes calls (deviates from a literal reading of brief §11)
 

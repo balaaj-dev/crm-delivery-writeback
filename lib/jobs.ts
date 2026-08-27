@@ -45,10 +45,18 @@ import {
 import { logger, recordEvent } from './log';
 import { isDryRun } from './adapters/index';
 import { kvAvailable, kvGet, kvGetAllByPrefix, kvSet } from './kv';
+import { qstashAvailable, publishJobChunk } from './qstash';
 
 const JOBS_DIR = path.join(process.cwd(), 'data', 'jobs');
 const JOB_KV_PREFIX = 'delivery-job:';
-const PAGE_SIZE = 100;
+/**
+ * Also doubles as the QStash chunk size — one page = one "process this job"
+ * invocation. Kept small (not the original 100) so one invocation — each
+ * lead costs several real network calls (find/create contact, status
+ * update, message-history fetch, deal creation) — comfortably fits inside
+ * the route's maxDuration on Vercel rather than risking a timeout mid-page.
+ */
+const PAGE_SIZE = 20;
 
 export type JobStatus = 'queued' | 'running' | 'completed' | 'failed' | 'paused';
 
@@ -190,7 +198,40 @@ function messageToSyntheticEvent(
   };
 }
 
-/** Creates a job record and starts it running in the background — returns immediately, does not await completion. */
+/**
+ * Kicks off (or continues) work on a job — publishes the first "process this
+ * job" message to QStash when it's configured (real serverless-safe path),
+ * otherwise runs the whole job in-process (local dev — genuinely correct
+ * there, see file header). PUBLIC_BASE_URL must be set for the QStash path,
+ * since QStash calls back over the open internet, not from inside this
+ * process — falls back to in-process if it's missing, logging a warning,
+ * rather than silently publishing to a broken URL.
+ */
+function advanceJob(jobId: string, cfg: ClientConfig, adapter: CrmAdapter): void {
+  const baseUrl = process.env.PUBLIC_BASE_URL;
+  if (qstashAvailable() && baseUrl) {
+    publishJobChunk(`${baseUrl}/api/delivery/jobs/${jobId}/process`, {}).catch((err) => {
+      logger.error('failed to publish delivery job chunk to QStash', {
+        jobId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    });
+    return;
+  }
+  if (qstashAvailable() && !baseUrl) {
+    logger.warn('QStash is configured but PUBLIC_BASE_URL is not set — falling back to in-process (will not survive Vercel freezing this instance)', { jobId });
+  }
+  // Deliberately not awaited — see file header for exactly what this does
+  // and does not guarantee depending on where it's deployed.
+  runJob(jobId, cfg, adapter).catch((err) => {
+    logger.error('delivery job crashed outside its own error handling', {
+      jobId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  });
+}
+
+/** Creates a job record and starts it running — returns immediately, does not await completion. */
 export async function startDeliveryJob(
   cfg: ClientConfig,
   adapter: CrmAdapter,
@@ -219,16 +260,7 @@ export async function startDeliveryJob(
     updatedAt: new Date().toISOString(),
   };
   await saveJob(job);
-
-  // Deliberately not awaited — see file header for exactly what this does
-  // and does not guarantee depending on where it's deployed.
-  runJob(job.id, cfg, adapter).catch((err) => {
-    logger.error('delivery job crashed outside its own error handling', {
-      jobId: job.id,
-      error: err instanceof Error ? err.message : String(err),
-    });
-  });
-
+  advanceJob(job.id, cfg, adapter);
   return job;
 }
 
@@ -238,21 +270,24 @@ export async function resumeDeliveryJob(id: string, cfg: ClientConfig, adapter: 
   if (!job) return null;
   if (job.status === 'completed' || job.status === 'failed') return job;
 
-  runJob(id, cfg, adapter).catch((err) => {
-    logger.error('resumed delivery job crashed outside its own error handling', {
-      jobId: id,
-      error: err instanceof Error ? err.message : String(err),
-    });
-  });
+  advanceJob(id, cfg, adapter);
   return job;
 }
 
-async function runJob(jobId: string, cfg: ClientConfig, adapter: CrmAdapter): Promise<void> {
+/**
+ * Processes exactly one page (PAGE_SIZE leads) of a job and persists
+ * progress, then returns whether there's more work left to do. This is the
+ * unit of work QStash re-triggers per invocation (app/api/delivery/jobs/
+ * [id]/process/route.ts) — kept as its own function, not inlined into
+ * runJob's loop, specifically so both the QStash path (one page per HTTP
+ * request) and the in-process path (runJob's loop, below) share the exact
+ * same per-page logic instead of two copies drifting apart.
+ */
+export async function processJobPage(jobId: string, cfg: ClientConfig, adapter: CrmAdapter): Promise<boolean> {
   const job = await getJob(jobId);
-  if (!job) return;
+  if (!job || job.status === 'completed' || job.status === 'failed') return false;
 
   job.status = 'running';
-  await saveJob(job);
   const dryRun = isDryRun();
 
   // Same partial-mode interest filter as lib/delivery.ts — see that file's
@@ -262,7 +297,9 @@ async function runJob(jobId: string, cfg: ClientConfig, adapter: CrmAdapter): Pr
   // delivers every lead as a contact, but a deal should still only be
   // created for the ones genuinely marked Interested/Meeting Booked, same
   // distinction lib/dispatch.ts's own isDealSignal makes for live replies.
-  // Resolved once per job rather than per lead.
+  // Re-resolved every page rather than cached in the job record — one extra
+  // Smartlead API call per page is cheap, and simpler than persisting a Map
+  // across QStash-triggered invocations.
   let interestCategoryIds: Map<number, 'positive_reply' | 'meeting_booked'> | null = null;
   if (cfg.mode === 'partial' || cfg.behaviour.createDeal) {
     try {
@@ -274,7 +311,7 @@ async function runJob(jobId: string, cfg: ClientConfig, adapter: CrmAdapter): Pr
         job.failureReason = `Partial-mode delivery needs Smartlead's lead categories to filter for Interested/Meeting Booked leads, and that lookup failed: ${err instanceof Error ? err.message : String(err)}`;
         job.finishedAt = new Date().toISOString();
         await saveJob(job);
-        return;
+        return false;
       }
       // Full mode doesn't depend on this for delivery itself — degrade
       // gracefully by skipping deal creation this run rather than failing
@@ -286,139 +323,165 @@ async function runJob(jobId: string, cfg: ClientConfig, adapter: CrmAdapter): Pr
     }
   }
 
+  if (job.processed >= job.targetLeads) {
+    job.status = 'completed';
+    job.finishedAt = new Date().toISOString();
+    await saveJob(job);
+    return false;
+  }
+
   try {
     // targetLeads counts leads actually delivered, not leads scanned — in
     // partial mode those diverge (most campaign leads have no category yet
     // and get filtered out), so pagination keeps advancing on job.offset
     // regardless, bounded only by the campaign actually running out.
-    while (job.processed < job.targetLeads) {
-      const page = await listCampaignLeads(cfg.source.apiKey, job.campaignId, PAGE_SIZE, job.offset);
-      job.totalLeadsInCampaign = page.totalLeads;
+    const page = await listCampaignLeads(cfg.source.apiKey, job.campaignId, PAGE_SIZE, job.offset);
+    job.totalLeadsInCampaign = page.totalLeads;
 
-      if (page.leads.length === 0) break; // exhausted the campaign before hitting targetLeads
+    if (page.leads.length === 0) {
+      // Exhausted the campaign before hitting targetLeads.
+      job.status = 'completed';
+      job.finishedAt = new Date().toISOString();
+      await saveJob(job);
+      return false;
+    }
 
-      for (const lead of page.leads) {
-        if (job.processed >= job.targetLeads) break; // reached target mid-page
-        job.offset += 1;
+    for (const lead of page.leads) {
+      if (job.processed >= job.targetLeads) break; // reached target mid-page
+      job.offset += 1;
 
-        const baseLog = {
-          timestamp: new Date().toISOString(),
-          clientId: cfg.clientId,
-          clientName: cfg.clientName,
-          eventType: 'delivery',
-          eventId: `delivery-job:${jobId}:${lead.email}`,
-          dryRun,
-        };
+      const baseLog = {
+        timestamp: new Date().toISOString(),
+        clientId: cfg.clientId,
+        clientName: cfg.clientName,
+        eventType: 'delivery',
+        eventId: `delivery-job:${jobId}:${lead.email}`,
+        dryRun,
+      };
 
-        // interestCategoryIds is now resolved in full mode too (when
-        // createDeal is on, for the deal-creation check below) — so this
-        // filter must stay gated on cfg.mode itself, not just on whether
-        // the set exists, or full mode would wrongly start skipping leads
-        // it's supposed to deliver unconditionally.
-        const dealSignal =
-          interestCategoryIds != null && lead.leadCategoryId != null
-            ? interestCategoryIds.get(lead.leadCategoryId)
-            : undefined;
-        const isInterested = dealSignal != null;
+      // interestCategoryIds is now resolved in full mode too (when
+      // createDeal is on, for the deal-creation check below) — so this
+      // filter must stay gated on cfg.mode itself, not just on whether
+      // the set exists, or full mode would wrongly start skipping leads
+      // it's supposed to deliver unconditionally.
+      const dealSignal =
+        interestCategoryIds != null && lead.leadCategoryId != null
+          ? interestCategoryIds.get(lead.leadCategoryId)
+          : undefined;
+      const isInterested = dealSignal != null;
 
-        if (cfg.mode === 'partial' && !isInterested) {
-          job.skippedNotInterested += 1;
-          await recordEvent({ ...baseLog, outcome: 'skip', reason: 'not_interested_category' });
-          await saveJob(job);
-          continue;
+      if (cfg.mode === 'partial' && !isInterested) {
+        job.skippedNotInterested += 1;
+        await recordEvent({ ...baseLog, outcome: 'skip', reason: 'not_interested_category' });
+        await saveJob(job);
+        continue;
+      }
+
+      job.processed += 1;
+
+      try {
+        let ref = await adapter.findRecord(lead.email, cfg);
+        let isNewRecord = false;
+        if (ref) {
+          job.alreadyExisted += 1;
+        } else {
+          ref = await adapter.createRecord(leadToSyntheticEvent(lead, cfg.clientId), cfg);
+          job.created += 1;
+          isNewRecord = true;
         }
 
-        job.processed += 1;
-
-        try {
-          let ref = await adapter.findRecord(lead.email, cfg);
-          let isNewRecord = false;
-          if (ref) {
-            job.alreadyExisted += 1;
-          } else {
-            ref = await adapter.createRecord(leadToSyntheticEvent(lead, cfg.clientId), cfg);
-            job.created += 1;
-            isNewRecord = true;
-          }
-
-          const statusValue = deliveryStatusValue(lead);
-          if (statusValue) {
-            try {
-              await adapter.updateStatus(ref, statusValue, cfg);
-            } catch (err) {
-              logger.warn('delivery job: status backfill failed', {
-                jobId,
-                email: lead.email,
-                error: err instanceof Error ? err.message : String(err),
-              });
-            }
-          }
-
-          let leadActivitiesLogged = 0;
+        const statusValue = deliveryStatusValue(lead);
+        if (statusValue) {
           try {
-            const history = await listLeadMessageHistory(cfg.source.apiKey, job.campaignId, lead.id);
-            for (const message of history) {
-              await adapter.writeActivity(ref, messageToSyntheticEvent(message, lead, cfg.clientId), cfg);
-              leadActivitiesLogged += 1;
-            }
-            job.activitiesLogged += leadActivitiesLogged;
+            await adapter.updateStatus(ref, statusValue, cfg);
           } catch (err) {
-            logger.warn('delivery job: activity backfill failed', {
+            logger.warn('delivery job: status backfill failed', {
               jobId,
               email: lead.email,
               error: err instanceof Error ? err.message : String(err),
             });
           }
-
-          // Deal creation — the gap found live, 26 Aug 2026: delivery
-          // (this file) never went through lib/dispatch.ts, so it never
-          // did what a real webhook-triggered positive_reply/meeting_booked
-          // does — create a deal. Mirrors dispatch.ts's own isDealSignal
-          // check (same interest test as the partial-mode filter above,
-          // just also evaluated in full mode now), gated to a record this
-          // pass actually created — an already-existing contact isn't
-          // re-given a deal on every subsequent delivery run, since this
-          // file has no durable per-ref dedup the way dispatch.ts does.
-          if (isNewRecord && dealSignal && cfg.behaviour.createDeal && adapter.createDeal) {
-            try {
-              await adapter.createDeal(ref, leadToSyntheticEvent(lead, cfg.clientId), cfg, dealSignal);
-              job.dealsCreated += 1;
-            } catch (err) {
-              logger.warn('delivery job: deal creation failed', {
-                jobId,
-                email: lead.email,
-                error: err instanceof Error ? err.message : String(err),
-              });
-            }
-          }
-
-          await recordEvent({
-            ...baseLog,
-            outcome: 'success',
-            detail: { ref, activitiesLogged: leadActivitiesLogged, jobId },
-          });
-        } catch (err) {
-          const reason = err instanceof Error ? err.message : String(err);
-          job.errors.push({ email: lead.email, reason });
-          await recordEvent({ ...baseLog, outcome: 'error', reason });
         }
 
-        // Persisted after every lead — this is what makes progress visible
-        // in near-real-time via GET /api/delivery/jobs/:id, and what makes
-        // the job resumable from a precise point if the process restarts.
-        await saveJob(job);
+        let leadActivitiesLogged = 0;
+        try {
+          const history = await listLeadMessageHistory(cfg.source.apiKey, job.campaignId, lead.id);
+          for (const message of history) {
+            await adapter.writeActivity(ref, messageToSyntheticEvent(message, lead, cfg.clientId), cfg);
+            leadActivitiesLogged += 1;
+          }
+          job.activitiesLogged += leadActivitiesLogged;
+        } catch (err) {
+          logger.warn('delivery job: activity backfill failed', {
+            jobId,
+            email: lead.email,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+
+        // Deal creation — the gap found live, 26 Aug 2026: delivery
+        // (this file) never went through lib/dispatch.ts, so it never
+        // did what a real webhook-triggered positive_reply/meeting_booked
+        // does — create a deal. Mirrors dispatch.ts's own isDealSignal
+        // check (same interest test as the partial-mode filter above,
+        // just also evaluated in full mode now), gated to a record this
+        // pass actually created — an already-existing contact isn't
+        // re-given a deal on every subsequent delivery run, since this
+        // file has no durable per-ref dedup the way dispatch.ts does.
+        if (isNewRecord && dealSignal && cfg.behaviour.createDeal && adapter.createDeal) {
+          try {
+            await adapter.createDeal(ref, leadToSyntheticEvent(lead, cfg.clientId), cfg, dealSignal);
+            job.dealsCreated += 1;
+          } catch (err) {
+            logger.warn('delivery job: deal creation failed', {
+              jobId,
+              email: lead.email,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          }
+        }
+
+        await recordEvent({
+          ...baseLog,
+          outcome: 'success',
+          detail: { ref, activitiesLogged: leadActivitiesLogged, jobId },
+        });
+      } catch (err) {
+        const reason = err instanceof Error ? err.message : String(err);
+        job.errors.push({ email: lead.email, reason });
+        await recordEvent({ ...baseLog, outcome: 'error', reason });
       }
 
-      if (job.offset >= (job.totalLeadsInCampaign ?? Infinity)) break;
+      // Persisted after every lead — this is what makes progress visible
+      // in near-real-time via GET /api/delivery/jobs/:id, and what makes
+      // the job resumable from a precise point if the process restarts.
+      await saveJob(job);
     }
 
-    job.status = 'completed';
-    job.finishedAt = new Date().toISOString();
-    await saveJob(job);
+    const exhausted = job.offset >= (job.totalLeadsInCampaign ?? Infinity);
+    const reachedTarget = job.processed >= job.targetLeads;
+    if (exhausted || reachedTarget) {
+      job.status = 'completed';
+      job.finishedAt = new Date().toISOString();
+      await saveJob(job);
+      return false;
+    }
+
+    await saveJob(job); // status stays 'running' — more pages to go
+    return true;
   } catch (err) {
     job.status = 'failed';
     job.failureReason = err instanceof Error ? err.message : String(err);
     job.finishedAt = new Date().toISOString();
     await saveJob(job);
+    return false;
+  }
+}
+
+/** In-process runner: loops processJobPage until it reports no more work. Used only when QStash isn't configured (local dev) — see advanceJob. */
+async function runJob(jobId: string, cfg: ClientConfig, adapter: CrmAdapter): Promise<void> {
+  let more = true;
+  while (more) {
+    more = await processJobPage(jobId, cfg, adapter);
   }
 }

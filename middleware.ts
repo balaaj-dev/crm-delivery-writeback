@@ -4,11 +4,15 @@ import { NextResponse, type NextRequest } from 'next/server';
  * Login/auth layer, added per Jairo's 26 Aug 2026 feedback ("needs a
  * login/auth layer once it's off Balaaj's laptop"). MVP mechanism —
  * HTTP Basic Auth against SETUP_AUTH_USER/SETUP_AUTH_PASS, gating the
- * wizard, the event log, and every API route except the incoming
- * Smartlead webhook (which has its own per-client secret check — see
- * app/api/webhooks/smartlead/route.ts; Smartlead's own dispatcher can't
- * present a Basic Auth header, so that one route stays outside this gate
- * by design, not by oversight).
+ * wizard, the event log, and every API route except:
+ * - the incoming Smartlead webhook (its own per-client secret check — see
+ *   app/api/webhooks/smartlead/route.ts; Smartlead's own dispatcher can't
+ *   present a Basic Auth header), and
+ * - the QStash-triggered delivery-job processor (its own cryptographic
+ *   signature check — see lib/qstash.ts and
+ *   app/api/delivery/jobs/[id]/process/route.ts; QStash can't present a
+ *   Basic Auth header either).
+ * Both stay outside this gate by design, not by oversight.
  *
  * If SETUP_AUTH_USER/SETUP_AUTH_PASS aren't set, this is a no-op — local
  * dev stays open, same graceful-degradation pattern as the rest of this
@@ -41,5 +45,7 @@ export function middleware(req: NextRequest): NextResponse {
 }
 
 export const config = {
-  matcher: ['/((?!api/webhooks/smartlead|_next/static|_next/image|favicon.ico).*)'],
+  matcher: [
+    '/((?!api/webhooks/smartlead|api/delivery/jobs/.*/process|_next/static|_next/image|favicon.ico).*)',
+  ],
 };
