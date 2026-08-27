@@ -13,7 +13,15 @@ import { verifySessionToken, SESSION_COOKIE_NAME } from '@/lib/session';
  *   app/api/delivery/jobs/[id]/process/route.ts; QStash can't present one
  *   either), and
  * - /login, /api/login, /api/logout — have to stay reachable to log in at
- *   all, otherwise every request bounces to /login and back forever.
+ *   all, otherwise every request bounces to /login and back forever, and
+ * - the public/ image assets (logo, icon) — gating these broke the header
+ *   logo in production (27 Aug 2026): next/image's optimizer re-fetches the
+ *   underlying file itself with no way to carry the viewer's session
+ *   cookie, so a gated /cymate-logo-mark.png meant that internal fetch got
+ *   redirected to the /login HTML page instead of image bytes, and
+ *   next/image logged "isn't a valid image". These files aren't sensitive,
+ *   so just exempting them is simpler and more robust than trying to make
+ *   next/image forward credentials on its internal fetch.
  * These stay outside this gate by design, not by oversight.
  *
  * Primary mechanism is a signed session cookie (see lib/session.ts) set by
@@ -29,7 +37,14 @@ import { verifySessionToken, SESSION_COOKIE_NAME } from '@/lib/session';
  * login) — good enough to gate a small internal tool, not a substitute for
  * real SSO if this grows past a handful of CSMs.
  */
-const PUBLIC_PATHS = new Set(['/login', '/api/login', '/api/logout']);
+const PUBLIC_PATHS = new Set([
+  '/login',
+  '/api/login',
+  '/api/logout',
+  '/cymate-logo-mark.png',
+  '/cymate-logo-full.png',
+  '/icon.png',
+]);
 
 export async function middleware(req: NextRequest): Promise<NextResponse> {
   const user = process.env.SETUP_AUTH_USER;
