@@ -441,13 +441,54 @@ upgrade Next.
   URL — needs a second deploy pass once known), `SETUP_AUTH_USER`/`SETUP_AUTH_PASS` (genuinely
   needed now — see below), `CONFIG_ENCRYPTION_KEY` (generated this pass, see chat history — do not
   regenerate, or already-encrypted session data becomes unreadable).
-- `middleware.ts`'s HTTP Basic Auth gate and `lib/crypto.ts`'s credential encryption are now
-  **active locally** (27 Aug 2026, per Balaaj: "that's our responsibility, not Kenley's") — both
-  set in `.env.local` and confirmed live: unauthenticated requests get a real 401 with the right
-  `WWW-Authenticate` header, the Smartlead webhook route stays correctly exempt, valid credentials
-  work, and a fresh config save lands on disk with the `enc:v1:` prefix (a stale pre-encryption
-  entry in `data/client-overrides.json` confirmed this wasn't a false positive — only *new* writes
-  are encrypted, existing plaintext entries stay as-is until next written). The same
-  `SETUP_AUTH_USER`/`PASS`/`CONFIG_ENCRYPTION_KEY` values need to be set on Vercel too — see chat
-  history for the actual values, do not regenerate `CONFIG_ENCRYPTION_KEY` independently or
-  already-encrypted local data becomes unreadable.
+- `middleware.ts`'s auth gate and `lib/crypto.ts`'s credential encryption are now **active
+  locally** (27 Aug 2026, per Balaaj: "that's our responsibility, not Kenley's") — both set in
+  `.env.local` and confirmed live: unauthenticated requests get gated, the Smartlead webhook route
+  stays correctly exempt, valid credentials work, and a fresh config save lands on disk with the
+  `enc:v1:` prefix (a stale pre-encryption entry in `data/client-overrides.json` confirmed this
+  wasn't a false positive — only *new* writes are encrypted, existing plaintext entries stay as-is
+  until next written). The same `SETUP_AUTH_USER`/`PASS`/`CONFIG_ENCRYPTION_KEY` values need to be
+  set on Vercel too — see chat history for the actual values, do not regenerate
+  `CONFIG_ENCRYPTION_KEY` independently or already-encrypted local data becomes unreadable.
+
+### Branded login page replacing the Basic Auth dialog (27 Aug 2026)
+
+Same evening as the item above: once the Basic Auth gate was confirmed working live on a Vercel
+preview URL, Balaaj's reaction was "it worked but can't we have a good looking sign in page with
+Cymate's brand colours" — the native browser credential dialog is browser chrome, not a stylable
+page, so there was no way to reskin it directly. Replaced with a real session-cookie login flow:
+
+- `lib/session.ts` — stateless HMAC-SHA256 session tokens (`${expiry}.${hmac}`, no session store,
+  no DB). Verifying just recomputes the HMAC and checks it matches plus hasn't expired. Uses the
+  **Web Crypto API** (`crypto.subtle`), not `node:crypto` — this file is imported by
+  `middleware.ts`, and Next.js 14 middleware runs on the Edge runtime by default, which does not
+  have `node:crypto`. First draft used `node:crypto`'s `createHmac`/`timingSafeEqual` and would
+  have broken on Vercel (works fine in local `next dev` since that route only gets hit in Node
+  contexts there in practice, but the Edge runtime constraint is real on deploy) — caught before
+  pushing, not from a live failure.
+- `app/login/page.tsx` — the actual branded page (navy/orange, same rounded-2xl card and
+  `shadow-card` styling as the setup wizard). Posts to `app/api/login/route.ts`, which validates
+  against `SETUP_AUTH_USER`/`PASS` (unchanged) and sets an `httpOnly` cookie
+  (`cymate_session`, 7-day expiry). `app/api/logout/route.ts` clears it.
+- `middleware.ts` now checks, in order: Basic Auth header (kept as a fallback — convenient for
+  curl/script testing, and avoids breaking anything already relying on it) → the session cookie →
+  otherwise gate. Content-negotiated on failure: `/api/*` paths get a plain 401 JSON body (so the
+  wizard's own `fetch()` calls don't choke trying to `JSON.parse()` an HTML redirect page);
+  everything else 307-redirects to `/login?next=<original path>`. `/login`, `/api/login`, and
+  `/api/logout` are carved out of the gate itself (matcher-level, same pattern as the Smartlead
+  webhook and QStash processor exemptions) — otherwise every request bounces to `/login` and the
+  login page's own POST to `/api/login` would 401 before it could ever set the cookie.
+- Nav bar (`app/layout.tsx` → `app/components/HeaderNav.tsx`) hides itself entirely on `/login`
+  (a client component checking `usePathname()`) and otherwise shows a "Sign out" button
+  (`app/components/LogoutButton.tsx`) next to the existing Setup/Event log links, gated on
+  `SETUP_AUTH_USER`/`PASS` being set at all — same graceful no-auth-configured fallback as
+  everywhere else in this app.
+- Verified live locally end-to-end: unauthenticated `/setup` redirects to
+  `/login?next=%2Fsetup`, submitting valid credentials lands back on `/setup` with the cookie set,
+  unauthenticated `/api/clients` returns `401 {"error":"Authentication required"}` (not a
+  redirect), Basic Auth still works as a fallback (`curl -u`), and "Sign out" clears the cookie and
+  bounces back to `/login`. `tsc --noEmit`, `eslint .`, and `npm test` (44 tests) all clean.
+  **Not yet re-verified on the actual Vercel deployment** — the Basic-Auth-only version was
+  confirmed live there on 27 Aug 2026, but this cookie-based replacement hasn't been redeployed
+  yet. Do that before assuming the branded page is what a fresh visitor to the `*.vercel.app` URL
+  actually sees.

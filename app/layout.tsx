@@ -2,6 +2,7 @@ import type { Metadata } from 'next';
 import { Inter, Space_Grotesk } from 'next/font/google';
 import Image from 'next/image';
 import Link from 'next/link';
+import { HeaderNav } from './components/HeaderNav';
 import './globals.css';
 
 const inter = Inter({ subsets: ['latin'], variable: '--font-inter' });
@@ -26,17 +27,6 @@ function DryRunBadge() {
   );
 }
 
-function NavLink({ href, children }: { href: string; children: React.ReactNode }) {
-  return (
-    <Link
-      href={href}
-      className="rounded-md px-3 py-1.5 text-sm font-medium text-white/70 transition hover:bg-white/10 hover:text-white"
-    >
-      {children}
-    </Link>
-  );
-}
-
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
     <html lang="en" className={`${inter.variable} ${display.variable}`}>
@@ -50,13 +40,10 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
               </span>
               <span className="hidden text-sm text-white/50 sm:inline">RevOps · S1 Writeback</span>
             </Link>
-            <nav className="flex items-center gap-1">
-              <NavLink href="/setup">Setup</NavLink>
-              <NavLink href="/log">Event log</NavLink>
-              <div className="ml-3 border-l border-white/10 pl-3">
-                <DryRunBadge />
-              </div>
-            </nav>
+            <HeaderNav
+              showLogout={Boolean(process.env.SETUP_AUTH_USER && process.env.SETUP_AUTH_PASS)}
+              dryRunBadge={<DryRunBadge />}
+            />
           </div>
         </header>
         {children}
