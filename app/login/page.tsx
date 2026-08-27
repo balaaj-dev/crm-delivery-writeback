@@ -52,17 +52,29 @@ function EyeOffIcon({ className }: { className?: string }) {
 function LoginForm() {
   const router = useRouter();
   const searchParams = useSearchParams();
-  const [username, setUsername] = useState('');
-  const [password, setPassword] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [showPassword, setShowPassword] = useState(false);
 
-  async function handleSubmit(e: FormEvent) {
+  /**
+   * Reads values from FormData (the live DOM state) rather than React
+   * state synced via onChange — fixes a real bug (27 Aug 2026, Balaaj:
+   * "the login button needs to be pressed twice"). Password managers
+   * (LastPass here) fill inputs without always firing the events React
+   * listens for, so controlled-input state can silently stay empty while
+   * the field looks filled; the button's disabled={!username||!password}
+   * then blocks the first click, and only a second click (after some
+   * other interaction happens to sync state) goes through. Uncontrolled
+   * inputs + FormData sidesteps that class of bug entirely.
+   */
+  async function handleSubmit(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
     setError(null);
     setSubmitting(true);
     try {
+      const formData = new FormData(e.currentTarget);
+      const username = String(formData.get('username') ?? '');
+      const password = String(formData.get('password') ?? '');
       const res = await fetch('/api/login', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -104,11 +116,11 @@ function LoginForm() {
             </label>
             <input
               id="username"
+              name="username"
               autoFocus
+              required
               autoComplete="username"
               className="mt-2 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 shadow-sm transition focus:border-cymate-orange focus:outline-none focus:ring-2 focus:ring-cymate-orange/20"
-              value={username}
-              onChange={(e) => setUsername(e.target.value)}
             />
           </div>
           <div>
@@ -118,11 +130,11 @@ function LoginForm() {
             <div className="relative mt-2">
               <input
                 id="password"
+                name="password"
                 type={showPassword ? 'text' : 'password'}
+                required
                 autoComplete="current-password"
                 className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 pr-10 text-sm text-slate-900 shadow-sm transition focus:border-cymate-orange focus:outline-none focus:ring-2 focus:ring-cymate-orange/20"
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
               />
               <button
                 type="button"
@@ -146,7 +158,7 @@ function LoginForm() {
 
         <button
           type="submit"
-          disabled={submitting || !username || !password}
+          disabled={submitting}
           className="mt-6 flex w-full items-center justify-center gap-2 rounded-lg bg-cymate-orange px-5 py-2.5 text-sm font-semibold text-white shadow-sm transition hover:bg-cymate-orange-dark disabled:cursor-not-allowed disabled:opacity-50"
         >
           {submitting && <Spinner className="h-4 w-4" />}
