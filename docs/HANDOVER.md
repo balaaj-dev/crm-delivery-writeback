@@ -291,7 +291,7 @@ picker has been step 9 since then. Confirmed live the corrected copy renders.
 | Item | Where | Status |
 | --- | --- | --- |
 | Exact Smartlead webhook payload shape per event | `lib/sources/smartlead.ts` | Built against a documented, reasonable assumption. Not confirmed live. |
-| Smartlead webhook signature/verification mechanism | `app/api/webhooks/smartlead/route.ts` | Not implemented at all — `SMARTLEAD_WEBHOOK_SECRET` is an unused env var placeholder. This endpoint is not verified against payload spoofing. |
+| ~~Smartlead webhook signature/verification mechanism~~ | `app/api/webhooks/smartlead/route.ts` | **RESOLVED 26 Aug 2026.** Smartlead doesn't document a request-signing scheme, so this uses a shared secret instead: a random value generated per client at registration time, embedded in the registered URL, required on every call — a client with no secret configured (registration never run) rejects everything. Fail closed, not open. |
 | ~~Smartlead webhook-registration endpoint + payload shape~~ | `lib/sources/smartlead-api.ts` `registerSmartleadWebhook` | **SUPERSEDED 27 Aug 2026.** The `POST /campaigns/{id}/webhooks` path (confirmed 26 Aug) worked, but is one webhook *per campaign* with no dedup — a real client with 8 active campaigns and several test runs accumulated 40+ duplicate webhooks in one day. Switched to `POST /webhook/create` with `association_type: 1` ("User Level"), confirmed live: one call registers a single account-wide webhook covering every campaign, present and future, and it accepts the exact same 7 event names already confirmed (including `LEAD_CATEGORY_UPDATED` — checked directly, since a different account-level webhook variant documented elsewhere in Smartlead's docs does NOT support it, which would have been a silent, serious regression). The response's `data.id.id` is the webhook's real id; `email_campaign_id: null` on read-back confirms account-wide scope. `DELETE /webhook/delete/{id}` works for webhooks created either the old or new way. **Still unverified**: what a live-fired event's actual JSON body looks like — registering successfully doesn't prove that. This has been the single biggest untested gap in this project since Milestone 2 and remains so; a documented generic example shows `{event, timestamp, campaign_id, lead: {...}, reply: {...}}`, which does NOT match this app's schema (`event_type`, `event_timestamp`, `lead_category`, etc.) — but that example is for a different, simpler webhook variant, so it may not apply here. Do not assume `lib/sources/smartlead.ts`'s parser is correct for a real payload until one has actually been received and inspected. |
 | ~~Smartlead lead-categories endpoint~~ | `lib/sources/smartlead-api.ts` `listLeadCategories` | **CONFIRMED LIVE 25 Aug 2026** against a real Lotus Labs account: `GET /leads/fetch-categories?api_key=...` returns `[{id, name, sentiment_type}]`. Real category names differ from the brief's assumed defaults — Smartlead's own default set is `Interested`, `Meeting Request` (not "Meeting Booked"), `Not Interested`, `Do Not Contact`, `Information Request`, `Out Of Office`, `Wrong Person`, plus per-workspace custom categories like `Uncategorizable by Ai`/`Sender Originated Bounce`/`Nurturing`. `DEFAULT_STATUS_MAP` in `lib/types.ts` still says "Meeting Booked" — harmless because the wizard always overwrites it with a client's live categories (step 8), but worth fixing the constant itself so nobody copies it verbatim into a real client's statusMap. |
 | HubSpot rate limits | `lib/adapters/hubspot.ts` | Not checked live. Implemented: serial requests, single 429 retry with a 1s delay, no backoff system (by design — full backoff is out of scope). |
@@ -347,10 +347,19 @@ upgrade Next.
 
 ## Deployment
 
-- Not deployed to Vercel in this pass (scaffold-only, per explicit instruction). The app is
-  structured as a standard Next.js App Router project with no non-Vercel-compatible dependencies,
-  so `vercel deploy` (or the GitHub→Vercel integration) should work once a project is created —
-  set the env vars from `.env.example` in the Vercel project settings first, especially leaving
-  `DRY_RUN=true` until someone deliberately decides otherwise.
-- Not pushed to a remote GitHub repo in this pass — committed locally only. Push once the repo
-  name/org is decided (open item 5 above).
+- Pushed to GitHub 27 Aug 2026: `https://github.com/balaaj-dev/crm-delivery-writeback` (private,
+  Balaaj's personal account — the Cymate org was still blocked on Kenley's access grant at the
+  time, so this is a working location, not necessarily the final one).
+- Not yet deployed to Vercel — Kenley is being asked to do this. The app is a standard Next.js App
+  Router project with no non-Vercel-compatible dependencies, so the GitHub→Vercel integration
+  should work with zero build config. Env vars to set (see `.env.example` for the full picture):
+  `CONFIG_SOURCE=airtable`, `AIRTABLE_API_KEY`, `DRY_RUN=true` (flip only right before the live
+  webhook test, deliberately, with everyone aware), `PUBLIC_BASE_URL` (the assigned `*.vercel.app`
+  URL — needs a second deploy pass once known), `SETUP_AUTH_USER`/`SETUP_AUTH_PASS` (genuinely
+  needed now — see below), `CONFIG_ENCRYPTION_KEY` (generated this pass, see chat history — do not
+  regenerate, or already-encrypted session data becomes unreadable).
+- `middleware.ts`'s HTTP Basic Auth gate and `lib/crypto.ts`'s credential encryption are both
+  built but still **inactive** in every environment as of this pass — neither `SETUP_AUTH_USER`/
+  `PASS` nor `CONFIG_ENCRYPTION_KEY` is set anywhere yet, including locally. This was a reasonable
+  default while everything ran on localhost; it stops being reasonable the moment this is reachable
+  from the public internet on Vercel. Do not leave a deployed instance running without both set.
