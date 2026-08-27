@@ -145,7 +145,7 @@ export const mockAdapter: CrmAdapter = {
     logger.warn('mock adapter updateStatus: ref not found', { ref });
   },
 
-  async createDeal(ref, _event, _cfg) {
+  async createDeal(ref, _event, _cfg, _dealSignal) {
     for (const contact of contacts.values()) {
       if (contact.ref.id === ref.id) {
         contact.dealCreated = true;

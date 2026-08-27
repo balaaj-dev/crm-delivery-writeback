@@ -256,6 +256,130 @@ function buildContactProperties(event: CanonicalEvent, cfg: ClientConfig): Recor
   return properties;
 }
 
+/**
+ * Find-or-create the prospect's company by domain and associate it with a
+ * contact or deal. Added 27 Aug 2026 per Jairo/Balaaj feedback: deals moved
+ * to Interested had no company record attached in HubSpot.
+ *
+ * [VERIFY-once-scoped]: `GET /crm/v3/objects/companies/{domain}?idProperty=domain`
+ * confirmed live to be a real, recognized route — it returns a
+ * MISSING_SCOPES error naming `crm.objects.companies.read` (403, not 404),
+ * which HubSpot only does for routes it recognizes. The access token in use
+ * this session does not have that scope (or the `.write` counterpart needed
+ * to create one), so the create/search calls below are unverified against a
+ * live portal — add `crm.objects.companies.read` and
+ * `crm.objects.companies.write` to the Private App/Service Key before
+ * trusting this path. Returns null (logs a warning) rather than throwing on
+ * a missing-scope or any other failure, so a company-record gap never blocks
+ * the contact/deal write it's attached to.
+ */
+async function findOrCreateCompany(
+  cfg: ClientConfig,
+  domain: string | undefined,
+  companyName: string | undefined,
+): Promise<string | null> {
+  if (!domain) return null;
+
+  const findRes = await hubspotFetch(
+    cfg,
+    `/crm/v3/objects/companies/${encodeURIComponent(domain)}?idProperty=domain`,
+  );
+  if (findRes.ok) {
+    const body = (await findRes.json()) as { id: string };
+    return body.id;
+  }
+  if (findRes.status !== 404) {
+    logger.warn('hubspot: findOrCreateCompany lookup failed, skipping company association', {
+      domain,
+      status: findRes.status,
+      detail: hubspotErrorSummary(await findRes.text()),
+    });
+    return null;
+  }
+
+  const createRes = await hubspotFetch(cfg, '/crm/v3/objects/companies', {
+    method: 'POST',
+    body: JSON.stringify({ properties: { domain, name: companyName ?? domain } }),
+  });
+  if (!createRes.ok) {
+    logger.warn('hubspot: findOrCreateCompany create failed, skipping company association', {
+      domain,
+      status: createRes.status,
+      detail: hubspotErrorSummary(await createRes.text()),
+    });
+    return null;
+  }
+  const created = (await createRes.json()) as { id: string };
+  return created.id;
+}
+
+async function associateWithCompany(
+  cfg: ClientConfig,
+  objectType: 'contacts' | 'deals',
+  objectId: string,
+  companyId: string,
+): Promise<void> {
+  const res = await hubspotFetch(
+    cfg,
+    `/crm/v4/objects/${objectType}/${objectId}/associations/default/companies/${companyId}`,
+    { method: 'PUT' },
+  );
+  if (!res.ok) {
+    logger.warn('hubspot: associateWithCompany failed', {
+      objectType,
+      objectId,
+      companyId,
+      status: res.status,
+      detail: hubspotErrorSummary(await res.text()),
+    });
+  }
+}
+
+/**
+ * Any deals already associated with this contact — used by writeActivity to
+ * also put the email/note engagement on the deal's timeline, not just the
+ * contact's, addressing Balaaj's "can't see last contacted on the deal"
+ * feedback (27 Aug 2026). HubSpot's own hs_engagements_last_contacted only
+ * populates on objects the engagement is actually associated with.
+ */
+async function findAssociatedDealIds(cfg: ClientConfig, contactId: string): Promise<string[]> {
+  const res = await hubspotFetch(cfg, `/crm/v4/objects/contacts/${contactId}/associations/deals`);
+  if (!res.ok) {
+    logger.warn('hubspot: findAssociatedDealIds failed', {
+      contactId,
+      status: res.status,
+      detail: hubspotErrorSummary(await res.text()),
+    });
+    return [];
+  }
+  const body = (await res.json()) as { results: Array<{ toObjectId: string }> };
+  return body.results.map((r) => r.toObjectId);
+}
+
+async function associateEngagementWithDeals(
+  cfg: ClientConfig,
+  engagementType: 'emails' | 'notes',
+  engagementId: string,
+  dealIds: string[],
+): Promise<void> {
+  for (const dealId of dealIds) {
+    const res = await hubspotFetch(
+      cfg,
+      `/crm/v4/objects/${engagementType}/${engagementId}/associations/default/deals/${dealId}`,
+      { method: 'PUT' },
+    );
+    if (!res.ok) {
+      logger.warn('hubspot: associateEngagementWithDeals failed', {
+        engagementType,
+        engagementId,
+        dealId,
+        status: res.status,
+        detail: hubspotErrorSummary(await res.text()),
+      });
+    }
+  }
+}
+
 export const hubspotAdapter: CrmAdapter = {
   type: 'hubspot',
   integrationPath: 'native',
@@ -312,6 +436,12 @@ export const hubspotAdapter: CrmAdapter = {
     }
     const body = (await res.json()) as { id: string };
     logger.info('hubspot: created contact', { id: body.id });
+
+    const companyId = await findOrCreateCompany(cfg, event.prospect.domain, event.prospect.company);
+    if (companyId) {
+      await associateWithCompany(cfg, 'contacts', body.id, companyId);
+    }
+
     return { objectType: 'contact', id: body.id, url: `https://app.hubspot.com/contacts/${body.id}` };
   },
 
@@ -382,6 +512,11 @@ export const hubspotAdapter: CrmAdapter = {
           `HubSpot writeActivity (associate email) failed: ${hubspotErrorSummary(await assocRes.text())}`,
         );
       }
+
+      const dealIds = await findAssociatedDealIds(cfg, ref.id);
+      if (dealIds.length > 0) {
+        await associateEngagementWithDeals(cfg, 'emails', email.id, dealIds);
+      }
       return;
     }
 
@@ -423,6 +558,11 @@ export const hubspotAdapter: CrmAdapter = {
         `HubSpot writeActivity (associate note) failed: ${hubspotErrorSummary(await assocRes.text())}`,
       );
     }
+
+    const dealIds = await findAssociatedDealIds(cfg, ref.id);
+    if (dealIds.length > 0) {
+      await associateEngagementWithDeals(cfg, 'notes', note.id, dealIds);
+    }
   },
 
   async updateStatus(ref, status, cfg) {
@@ -451,25 +591,35 @@ export const hubspotAdapter: CrmAdapter = {
     }
   },
 
-  async createDeal(ref, event, cfg) {
+  async createDeal(ref, event, cfg, dealSignal) {
+    // Per-signal stage (Balaaj's 27 Aug 2026 confirmation: "two separate
+    // stage pickers") — a genuine Meeting Booked reply can land in a
+    // different pipeline stage than a plain Interested reply. Falls back to
+    // the legacy single dealStageOnCreate, then no stage at all, for configs
+    // that predate this field.
+    const configuredStage =
+      (dealSignal === 'meeting_booked'
+        ? cfg.behaviour.dealStageOnMeetingBooked
+        : cfg.behaviour.dealStageOnPositiveReply) ?? cfg.behaviour.dealStageOnCreate;
+
     // HubSpot silently drops `dealstage` unless `pipeline` is sent alongside
     // it (confirmed live, 25 Aug 2026 — no error, the value just comes back
     // null). Resolve which pipeline the configured stage actually belongs
     // to rather than guessing.
     let stageProperties: Record<string, string> = {};
-    if (cfg.behaviour.dealStageOnCreate) {
+    if (configuredStage) {
       const pipelines = await fetchDealPipelines(cfg);
       const match = pipelines
         .flatMap((p) => p.stages.map((s) => ({ pipelineId: p.id, stageId: s.id })))
-        .find((s) => s.stageId === cfg.behaviour.dealStageOnCreate);
+        .find((s) => s.stageId === configuredStage);
       if (match) {
         stageProperties = { pipeline: match.pipelineId, dealstage: match.stageId };
       } else {
         logger.warn(
-          'hubspot: configured dealStageOnCreate not found in any pipeline — sending it alone, HubSpot will likely drop it silently',
-          { dealStageOnCreate: cfg.behaviour.dealStageOnCreate },
+          'hubspot: configured deal stage not found in any pipeline — sending it alone, HubSpot will likely drop it silently',
+          { dealSignal, configuredStage },
         );
-        stageProperties = { dealstage: cfg.behaviour.dealStageOnCreate };
+        stageProperties = { dealstage: configuredStage };
       }
     }
 
@@ -503,6 +653,11 @@ export const hubspotAdapter: CrmAdapter = {
         assocRes.status,
         `HubSpot createDeal (associate) failed: ${hubspotErrorSummary(await assocRes.text())}`,
       );
+    }
+
+    const companyId = await findOrCreateCompany(cfg, event.prospect.domain, event.prospect.company);
+    if (companyId) {
+      await associateWithCompany(cfg, 'deals', deal.id, companyId);
     }
   },
 

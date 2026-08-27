@@ -258,6 +258,34 @@ like Lotus Labs, whose Status isn't "Active" yet) silently vanished. Fixed to ap
 that doesn't match an existing entry, since the whole point of a session override is testing a
 client outside the base list's normal filtering.
 
+## Deal-stage-per-signal + company/deal association (27 Aug 2026)
+
+Per Balaaj's feedback on a real HubSpot deal (Robert Watts/WattsAssociates.Org, id `344329258735`):
+"will it automatically assign the interested deal stage?" (differentiated by signal type), "its not
+creating a company record for the deal", and "I also can't see the info about this deal like last
+contacted". Three changes, all in `lib/adapters/hubspot.ts` unless noted:
+
+- `CrmAdapter.createDeal` (`lib/types.ts`) now takes a 4th argument, `dealSignal: 'positive_reply' |
+  'meeting_booked'`, threaded through from `lib/dispatch.ts`'s already-computed `effectiveType` and
+  from `lib/delivery.ts`/`lib/jobs.ts`'s `resolveInterestCategoryIds` (now returns a
+  `Map<categoryId, signal>` instead of a `Set<categoryId>`, so callers know *which* signal matched,
+  not just that one did). The wizard's step 9 ("Record behaviour") now shows two independent deal
+  stage pickers — confirmed live against a real HubSpot portal (Outspeak's Service Key): both
+  populate from the same live `listDealStages` call and hold independent values
+  (`dealStageOnPositiveReply=4203141827` "Interested", `dealStageOnMeetingBooked=4203141830`
+  "Meeting Booked" on that portal's real "Sales Outreach Pipeline").
+- `findOrCreateCompany`/`associateWithCompany` — **not yet confirmed live**, see the VERIFY table
+  below (missing `crm.objects.companies.*` scope on the token used this session).
+- `findAssociatedDealIds`/`associateEngagementWithDeals` — extends `writeActivity` to also put the
+  email/note engagement on any deal already associated with the contact, not just the contact
+  itself, so `hs_engagements_last_contacted` populates on the deal too. Also not yet confirmed live
+  (same session, same missing-scope blocker didn't block this one specifically, but it hasn't been
+  separately exercised against a real portal either — see VERIFY table).
+
+Also fixed in passing: step 3's copy still said "step 10 will ask which pipeline stage" for the
+deal-stage picker — stale from before the wizard steps were reordered earlier this session; the
+picker has been step 9 since then. Confirmed live the corrected copy renders.
+
 ## Unresolved [VERIFY] items — confirm against live vendor docs/accounts before DRY_RUN=false
 
 | Item | Where | Status |
@@ -267,6 +295,8 @@ client outside the base list's normal filtering.
 | ~~Smartlead webhook-registration endpoint + payload shape~~ | `lib/sources/smartlead-api.ts` `registerSmartleadWebhook` | **SUPERSEDED 27 Aug 2026.** The `POST /campaigns/{id}/webhooks` path (confirmed 26 Aug) worked, but is one webhook *per campaign* with no dedup — a real client with 8 active campaigns and several test runs accumulated 40+ duplicate webhooks in one day. Switched to `POST /webhook/create` with `association_type: 1` ("User Level"), confirmed live: one call registers a single account-wide webhook covering every campaign, present and future, and it accepts the exact same 7 event names already confirmed (including `LEAD_CATEGORY_UPDATED` — checked directly, since a different account-level webhook variant documented elsewhere in Smartlead's docs does NOT support it, which would have been a silent, serious regression). The response's `data.id.id` is the webhook's real id; `email_campaign_id: null` on read-back confirms account-wide scope. `DELETE /webhook/delete/{id}` works for webhooks created either the old or new way. **Still unverified**: what a live-fired event's actual JSON body looks like — registering successfully doesn't prove that. This has been the single biggest untested gap in this project since Milestone 2 and remains so; a documented generic example shows `{event, timestamp, campaign_id, lead: {...}, reply: {...}}`, which does NOT match this app's schema (`event_type`, `event_timestamp`, `lead_category`, etc.) — but that example is for a different, simpler webhook variant, so it may not apply here. Do not assume `lib/sources/smartlead.ts`'s parser is correct for a real payload until one has actually been received and inspected. |
 | ~~Smartlead lead-categories endpoint~~ | `lib/sources/smartlead-api.ts` `listLeadCategories` | **CONFIRMED LIVE 25 Aug 2026** against a real Lotus Labs account: `GET /leads/fetch-categories?api_key=...` returns `[{id, name, sentiment_type}]`. Real category names differ from the brief's assumed defaults — Smartlead's own default set is `Interested`, `Meeting Request` (not "Meeting Booked"), `Not Interested`, `Do Not Contact`, `Information Request`, `Out Of Office`, `Wrong Person`, plus per-workspace custom categories like `Uncategorizable by Ai`/`Sender Originated Bounce`/`Nurturing`. `DEFAULT_STATUS_MAP` in `lib/types.ts` still says "Meeting Booked" — harmless because the wizard always overwrites it with a client's live categories (step 8), but worth fixing the constant itself so nobody copies it verbatim into a real client's statusMap. |
 | HubSpot rate limits | `lib/adapters/hubspot.ts` | Not checked live. Implemented: serial requests, single 429 retry with a 1s delay, no backoff system (by design — full backoff is out of scope). |
+| HubSpot company find/create (`findOrCreateCompany`) | `lib/adapters/hubspot.ts` | **NOT CONFIRMED LIVE — missing scope.** Added 27 Aug 2026 per Balaaj's feedback (deals had no company record attached). `GET /crm/v3/objects/companies/{domain}?idProperty=domain` confirmed to be a real, recognized route (403 MISSING_SCOPES naming `crm.objects.companies.read`, not 404 — HubSpot only does that for routes it knows), but the token in use this session lacks both `crm.objects.companies.read` and `.write`. Add both scopes to the Service Key, then re-run a live delivery and check a real deal/contact for an attached company before trusting this path. Fails soft (logs a warning, does not throw) so a missing-scope environment never blocks the contact/deal write it's attached to — meaning it can silently no-op forever if nobody adds the scope and checks. |
+| HubSpot deal↔engagement association (`findAssociatedDealIds`/`associateEngagementWithDeals`) | `lib/adapters/hubspot.ts` | **NOT CONFIRMED LIVE.** Added 27 Aug 2026 per Balaaj's feedback ("can't see last contacted on the deal"). Uses `GET /crm/v4/objects/contacts/{id}/associations/deals` to find deals already linked to a contact, then associates the email/note engagement with each via the same default-association PUT pattern used for contacts. Should be a strict superset of already-confirmed calls (default associations are confirmed live for contacts/companies), but the specific `associations/deals` read endpoint itself hasn't been exercised against a real portal yet. |
 
 **What WAS confirmed live** (via HubSpot's/Smartlead's public docs and, for HubSpot, an actual
 test portal — see the section above — so worth recording rather than re-checking):

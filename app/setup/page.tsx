@@ -248,7 +248,8 @@ export default function SetupWizard() {
   const [categoriesWarning, setCategoriesWarning] = useState<string | null>(null);
   const [statusMap, setStatusMap] = useState<Record<string, string>>({});
 
-  const [dealStageOnCreate, setDealStageOnCreate] = useState('');
+  const [dealStageOnPositiveReply, setDealStageOnPositiveReply] = useState('');
+  const [dealStageOnMeetingBooked, setDealStageOnMeetingBooked] = useState('');
   const [dealStages, setDealStages] = useState<CrmDealStageDescriptor[]>([]);
   const [dealStagesWarning, setDealStagesWarning] = useState<string | null>(null);
   const [planLimitAcknowledged, setPlanLimitAcknowledged] = useState(false);
@@ -422,7 +423,8 @@ export default function SetupWizard() {
         createRecordOnInterestedReply,
         createRecordForAllLeads,
         createDeal,
-        dealStageOnCreate: dealStageOnCreate || undefined,
+        dealStageOnPositiveReply: dealStageOnPositiveReply || undefined,
+        dealStageOnMeetingBooked: dealStageOnMeetingBooked || undefined,
         planLimitAcknowledged,
         ownerId: ownerId || undefined,
       },
@@ -796,8 +798,8 @@ export default function SetupWizard() {
                 </label>
               </div>
               <p className="mt-2 text-xs text-slate-500">
-                Contact + Deal means step 7 will ask for a deal owner and step 10 will ask which
-                pipeline stage new deals open in. Contact only just needs a contact owner.
+                Contact + Deal means step 7 will ask for a deal owner and step 9 will ask which
+                pipeline stages new deals open in. Contact only just needs a contact owner.
               </p>
             </div>
 
@@ -1093,50 +1095,79 @@ export default function SetupWizard() {
               <b className="text-cymate-navy">{createDeal ? 'Contact + Deal' : 'Contact only'}</b>.
             </p>
             {createDeal && (
-              <div>
-                <label className="mb-1 block text-xs font-medium text-slate-500">
-                  Deal stage on create
-                </label>
-                <p className="mb-2 text-xs text-slate-500">
+              <div className="space-y-4">
+                <p className="text-xs text-slate-500">
                   This choice matters before the next step — Deliver contacts creates a deal for
-                  every genuinely interested lead it delivers, and it uses whatever stage is set
-                  here at the time.
+                  every genuinely interested lead it delivers, and it uses whatever stages are set
+                  here at the time. A Meeting Booked reply can land in a different stage than a
+                  plain Interested reply.
                 </p>
                 {dealStages.length === 0 && !dealStagesWarning && (
                   <button
                     onClick={loadDealStages}
-                    className="mb-2 rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-medium text-slate-700 transition hover:bg-slate-50"
+                    className="rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-medium text-slate-700 transition hover:bg-slate-50"
                   >
                     Load pipeline stages
                   </button>
                 )}
                 {dealStagesWarning && (
-                  <p className="mb-2 rounded-lg bg-amber-50 p-3 text-sm text-amber-800 ring-1 ring-inset ring-amber-200">
+                  <p className="rounded-lg bg-amber-50 p-3 text-sm text-amber-800 ring-1 ring-inset ring-amber-200">
                     Couldn&apos;t fetch real stages from {crmType} ({dealStagesWarning}). Enter the
-                    stage ID manually, or leave blank to use the pipeline&apos;s default stage.
+                    stage IDs manually, or leave blank to use the pipeline&apos;s default stage.
                   </p>
                 )}
-                {dealStages.length > 0 ? (
-                  <select
-                    className={inputClass}
-                    value={dealStageOnCreate}
-                    onChange={(e) => setDealStageOnCreate(e.target.value)}
-                  >
-                    <option value="">Use the pipeline&apos;s default stage</option>
-                    {dealStages.map((s) => (
-                      <option key={s.id} value={s.id}>
-                        {s.pipelineLabel} — {s.label}
-                      </option>
-                    ))}
-                  </select>
-                ) : (
-                  <input
-                    className={inputClass}
-                    placeholder="Deal stage ID (optional — leave blank for the pipeline default)"
-                    value={dealStageOnCreate}
-                    onChange={(e) => setDealStageOnCreate(e.target.value)}
-                  />
-                )}
+                <div>
+                  <label className="mb-1 block text-xs font-medium text-slate-500">
+                    Deal stage on Interested reply
+                  </label>
+                  {dealStages.length > 0 ? (
+                    <select
+                      className={inputClass}
+                      value={dealStageOnPositiveReply}
+                      onChange={(e) => setDealStageOnPositiveReply(e.target.value)}
+                    >
+                      <option value="">Use the pipeline&apos;s default stage</option>
+                      {dealStages.map((s) => (
+                        <option key={s.id} value={s.id}>
+                          {s.pipelineLabel} — {s.label}
+                        </option>
+                      ))}
+                    </select>
+                  ) : (
+                    <input
+                      className={inputClass}
+                      placeholder="Deal stage ID (optional — leave blank for the pipeline default)"
+                      value={dealStageOnPositiveReply}
+                      onChange={(e) => setDealStageOnPositiveReply(e.target.value)}
+                    />
+                  )}
+                </div>
+                <div>
+                  <label className="mb-1 block text-xs font-medium text-slate-500">
+                    Deal stage on Meeting Booked reply
+                  </label>
+                  {dealStages.length > 0 ? (
+                    <select
+                      className={inputClass}
+                      value={dealStageOnMeetingBooked}
+                      onChange={(e) => setDealStageOnMeetingBooked(e.target.value)}
+                    >
+                      <option value="">Use the pipeline&apos;s default stage</option>
+                      {dealStages.map((s) => (
+                        <option key={s.id} value={s.id}>
+                          {s.pipelineLabel} — {s.label}
+                        </option>
+                      ))}
+                    </select>
+                  ) : (
+                    <input
+                      className={inputClass}
+                      placeholder="Deal stage ID (optional — leave blank for the pipeline default)"
+                      value={dealStageOnMeetingBooked}
+                      onChange={(e) => setDealStageOnMeetingBooked(e.target.value)}
+                    />
+                  )}
+                </div>
               </div>
             )}
             {mode === 'full' && (

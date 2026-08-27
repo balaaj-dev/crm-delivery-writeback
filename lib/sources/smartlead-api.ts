@@ -257,17 +257,23 @@ export async function listLeadCategories(apiKey: string): Promise<SmartleadLeadC
  * who only ever bounced (never replied) but still got delivered and
  * incorrectly flagged as a positive-reply Lead. This is what
  * `lead.leadCategoryId` (see listCampaignLeads) is filtered against.
+ *
+ * Returns a Map (not just a Set) as of 27 Aug 2026 — callers need to know
+ * *which* of the two signals a given category id maps to now, not just
+ * that it's one of them, so delivery can pick the right deal stage
+ * (dealStageOnPositiveReply vs dealStageOnMeetingBooked) instead of
+ * lumping every deal into one shared stage.
  */
 export async function resolveInterestCategoryIds(
   apiKey: string,
   statusMap: Record<string, string>,
-): Promise<Set<number>> {
+): Promise<Map<number, 'positive_reply' | 'meeting_booked'>> {
   const categories = await listLeadCategories(apiKey);
-  const ids = new Set<number>();
+  const ids = new Map<number, 'positive_reply' | 'meeting_booked'>();
   for (const category of categories) {
     const mapped = statusMap[category.name];
     if (mapped === 'positive_reply' || mapped === 'meeting_booked') {
-      ids.add(Number(category.id));
+      ids.set(Number(category.id), mapped);
     }
   }
   return ids;

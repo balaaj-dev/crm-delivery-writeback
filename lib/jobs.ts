@@ -240,7 +240,7 @@ async function runJob(jobId: string, cfg: ClientConfig, adapter: CrmAdapter): Pr
   // created for the ones genuinely marked Interested/Meeting Booked, same
   // distinction lib/dispatch.ts's own isDealSignal makes for live replies.
   // Resolved once per job rather than per lead.
-  let interestCategoryIds: Set<number> | null = null;
+  let interestCategoryIds: Map<number, 'positive_reply' | 'meeting_booked'> | null = null;
   if (cfg.mode === 'partial' || cfg.behaviour.createDeal) {
     try {
       interestCategoryIds = await resolveInterestCategoryIds(cfg.source.apiKey, cfg.statusMap);
@@ -292,8 +292,11 @@ async function runJob(jobId: string, cfg: ClientConfig, adapter: CrmAdapter): Pr
         // filter must stay gated on cfg.mode itself, not just on whether
         // the set exists, or full mode would wrongly start skipping leads
         // it's supposed to deliver unconditionally.
-        const isInterested =
-          interestCategoryIds != null && lead.leadCategoryId != null && interestCategoryIds.has(lead.leadCategoryId);
+        const dealSignal =
+          interestCategoryIds != null && lead.leadCategoryId != null
+            ? interestCategoryIds.get(lead.leadCategoryId)
+            : undefined;
+        const isInterested = dealSignal != null;
 
         if (cfg.mode === 'partial' && !isInterested) {
           job.skippedNotInterested += 1;
@@ -353,9 +356,9 @@ async function runJob(jobId: string, cfg: ClientConfig, adapter: CrmAdapter): Pr
           // pass actually created — an already-existing contact isn't
           // re-given a deal on every subsequent delivery run, since this
           // file has no durable per-ref dedup the way dispatch.ts does.
-          if (isNewRecord && isInterested && cfg.behaviour.createDeal && adapter.createDeal) {
+          if (isNewRecord && dealSignal && cfg.behaviour.createDeal && adapter.createDeal) {
             try {
-              await adapter.createDeal(ref, leadToSyntheticEvent(lead, cfg.clientId), cfg);
+              await adapter.createDeal(ref, leadToSyntheticEvent(lead, cfg.clientId), cfg, dealSignal);
               job.dealsCreated += 1;
             } catch (err) {
               logger.warn('delivery job: deal creation failed', {

@@ -139,14 +139,13 @@ export async function dispatchEvent(
     }
 
     // 9. deal creation
-    const isDealSignal = effectiveType === 'positive_reply' || effectiveType === 'meeting_booked';
     if (
       cfg.behaviour.createDeal &&
-      isDealSignal &&
+      (effectiveType === 'positive_reply' || effectiveType === 'meeting_booked') &&
       adapter.createDeal &&
       !dealsCreatedForRef.has(ref.id)
     ) {
-      await adapter.createDeal(ref, event, cfg);
+      await adapter.createDeal(ref, event, cfg, effectiveType);
       dealsCreatedForRef.add(ref.id);
       actions.push('created_deal');
     }

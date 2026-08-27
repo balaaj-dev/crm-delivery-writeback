@@ -180,7 +180,12 @@ describe('deliverCampaignLeads', () => {
     };
 
     it('only delivers leads whose live category maps to positive_reply/meeting_booked — real incident regression (Tracie Cranford, 25 Aug 2026): a bounced, never-replied lead was wrongly delivered and marked a Lead', async () => {
-      vi.mocked(resolveInterestCategoryIds).mockResolvedValue(new Set([1, 2])); // Interested=1, Meeting Booked=2
+      vi.mocked(resolveInterestCategoryIds).mockResolvedValue(
+        new Map([
+          [1, 'positive_reply'],
+          [2, 'meeting_booked'],
+        ]),
+      ); // Interested=1, Meeting Booked=2
       vi.mocked(listCampaignLeads).mockResolvedValue({
         totalLeads: 3,
         leads: [

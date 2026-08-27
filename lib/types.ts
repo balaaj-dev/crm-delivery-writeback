@@ -161,7 +161,21 @@ export interface ClientConfig {
     createRecordOnInterestedReply: boolean;
     createRecordForAllLeads: boolean;
     createDeal: boolean;
+    /**
+     * Legacy single-stage fallback — kept for configs that predate the
+     * split below. Used only when the signal-specific stage for a given
+     * deal isn't set.
+     */
     dealStageOnCreate?: string;
+    /**
+     * Split 27 Aug 2026 per direct feedback: a deal created because someone
+     * booked a meeting should land directly in a "Meeting Booked"-type
+     * stage, not get lumped into the same stage as a plain positive reply.
+     * Falls back to dealStageOnCreate, then the pipeline's own default,
+     * if unset — see hubspot.ts's createDeal.
+     */
+    dealStageOnPositiveReply?: string;
+    dealStageOnMeetingBooked?: string;
     planLimitAcknowledged: boolean;
     /**
      * Required — no record gets created without this set. Contact owner
@@ -342,8 +356,19 @@ export interface CrmAdapter {
   /** Move status / lifecycle stage. */
   updateStatus(ref: CrmRecordRef, status: string, cfg: ClientConfig): Promise<void>;
 
-  /** Optional. */
-  createDeal?(ref: CrmRecordRef, event: CanonicalEvent, cfg: ClientConfig): Promise<void>;
+  /**
+   * Optional. `dealSignal` is which of the two deal-triggering signals
+   * caused this call — every real call site already knows this (it's the
+   * same check that decided to call createDeal at all), so the adapter can
+   * pick between behaviour.dealStageOnPositiveReply and
+   * .dealStageOnMeetingBooked instead of using one shared stage for both.
+   */
+  createDeal?(
+    ref: CrmRecordRef,
+    event: CanonicalEvent,
+    cfg: ClientConfig,
+    dealSignal: 'positive_reply' | 'meeting_booked',
+  ): Promise<void>;
 
   /** Powers the wizard's field-mapping step. */
   describeFields(cfg: ClientConfig, objectType: string): Promise<CrmFieldDescriptor[]>;

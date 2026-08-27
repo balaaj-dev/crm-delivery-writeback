@@ -167,7 +167,7 @@ export async function deliverCampaignLeads(
   // enforcing that. Full mode has no such restriction by design. Also
   // resolved in full mode when createDeal is on — see runJob's identical
   // comment in lib/jobs.ts, which this mirrors.
-  let interestCategoryIds: Set<number> | null = null;
+  let interestCategoryIds: Map<number, 'positive_reply' | 'meeting_booked'> | null = null;
   if (cfg.mode === 'partial' || cfg.behaviour.createDeal) {
     try {
       interestCategoryIds = await resolveInterestCategoryIds(cfg.source.apiKey, cfg.statusMap);
@@ -212,8 +212,11 @@ export async function deliverCampaignLeads(
     // See lib/jobs.ts's runJob for why this filter stays gated on
     // cfg.mode, not just on whether interestCategoryIds exists — it's now
     // resolved in full mode too, for the deal-creation check below.
-    const isInterested =
-      interestCategoryIds != null && lead.leadCategoryId != null && interestCategoryIds.has(lead.leadCategoryId);
+    const dealSignal =
+      interestCategoryIds != null && lead.leadCategoryId != null
+        ? interestCategoryIds.get(lead.leadCategoryId)
+        : undefined;
+    const isInterested = dealSignal != null;
 
     if (cfg.mode === 'partial' && !isInterested) {
       result.skippedNotInterested += 1;
@@ -269,9 +272,9 @@ export async function deliverCampaignLeads(
       // webhook-triggered positive_reply/meeting_booked does — create a
       // deal. Gated to a record this pass actually created, since this
       // file has no durable per-ref dedup the way dispatch.ts does.
-      if (isNewRecord && isInterested && cfg.behaviour.createDeal && adapter.createDeal) {
+      if (isNewRecord && dealSignal && cfg.behaviour.createDeal && adapter.createDeal) {
         try {
-          await adapter.createDeal(ref, leadToSyntheticEvent(lead, cfg.clientId), cfg);
+          await adapter.createDeal(ref, leadToSyntheticEvent(lead, cfg.clientId), cfg, dealSignal);
           result.dealsCreated += 1;
         } catch (err) {
           logger.warn('delivery: deal creation failed', {
