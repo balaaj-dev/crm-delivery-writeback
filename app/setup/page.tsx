@@ -432,6 +432,47 @@ export default function SetupWizard() {
       .catch((err) => setLoadError(String(err)));
   }, []);
 
+  /**
+   * Selecting a different client invalidates every downstream per-client
+   * fetch below — added 27 Aug 2026 after a real bug found live: the
+   * sidebar lets you jump directly to any completed step (not just via
+   * "Next"), which skips whichever step's own onClick normally re-fetches
+   * this data. Switching clients at step 1, then jumping straight to a
+   * later step via the sidebar, kept showing the *previous* client's stale
+   * campaigns/fields/owners/categories/deal stages — confirmed live as
+   * "step 10 always says 8 campaigns" for three different clients in a row,
+   * which was really just Lotus Labs' real count never getting cleared.
+   * Doesn't touch the CSM's own in-progress choices (sync scope, record
+   * type, field mappings) — only the data actually fetched from Smartlead/
+   * the CRM for whichever client was previously selected.
+   */
+  useEffect(() => {
+    if (!selectedClientId) return;
+    setCampaigns([]);
+    setCampaignsWarning(null);
+    setSelectedCampaignIds([]);
+    setCredentials({});
+    setTestResult(null);
+    setFields([]);
+    setOwners([]);
+    setOwnersWarning(null);
+    setOwnerId('');
+    setSmartleadFieldOptions([]);
+    setSmartleadFieldsWarning(null);
+    setSmartleadFieldsLoaded(false);
+    setCategories([]);
+    setCategoriesWarning(null);
+    setStatusMap({});
+    setDealStageOnPositiveReply('');
+    setDealStageOnMeetingBooked('');
+    setDealStages([]);
+    setDealStagesWarning(null);
+    loadCampaigns();
+    // Deliberately only re-runs on client change, not on every
+    // setter/loadCampaigns identity change (stable across renders here).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedClientId]);
+
   function applySyncScope(scope: SyncScope) {
     setSyncScope(scope);
     if (scope === 'positive_replies_only') {
