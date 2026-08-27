@@ -8,9 +8,81 @@
 
 body {
   background-color: var(--color-bg);
+  color-scheme: light;
 }
 
 ::selection {
   background-color: #fd5e02;
   color: white;
+}
+
+/*
+ * Dark mode, added 27 Aug 2026 per Balaaj's request to (a) match
+ * cymate.io's actual dark palette (near-black bg, white text, the same
+ * #FD5E02 orange — confirmed by inspecting the live site's computed
+ * styles) and (b) offer it as a toggle rather than forcing it, since a
+ * dense data-entry wizard reads worse on near-black than the marketing
+ * site's hero sections do.
+ *
+ * Deliberately implemented as a `.dark` class remap of Tailwind's own
+ * generated utility selectors (`.dark .bg-white { ... }`) rather than
+ * adding `dark:` variants inline across every component — this app's
+ * wizard (app/setup/page.tsx) is a single very large file with hundreds
+ * of className strings, and remapping the ~30 neutral/status color
+ * classes actually in use here at the token level covers the whole app
+ * from one place. Brand accents (cymate-orange, cymate-navy, the header
+ * bar) are intentionally left unchanged in both themes.
+ */
+:root.dark body {
+  --color-bg: #09080f;
+  color-scheme: dark;
+}
+
+.dark .bg-white { background-color: #15141d; }
+.dark .bg-white\/10 { background-color: rgba(255, 255, 255, 0.1); }
+.dark .bg-white\/60 { background-color: rgba(255, 255, 255, 0.06); }
+
+.dark .bg-slate-50 { background-color: #1c1c28; }
+.dark .bg-slate-50\/60 { background-color: rgba(255, 255, 255, 0.04); }
+.dark .bg-slate-50\/80 { background-color: rgba(255, 255, 255, 0.05); }
+.dark .bg-slate-100 { background-color: #232331; }
+.dark .bg-slate-200 { background-color: #2a2a3a; }
+
+.dark .text-slate-900 { color: #f8f8fa; }
+.dark .text-slate-700 { color: #e4e4ec; }
+.dark .text-slate-600 { color: #c7c7d4; }
+.dark .text-slate-500 { color: #aaaabb; }
+.dark .text-slate-400 { color: #8c8ca0; }
+.dark .text-cymate-navy { color: #f8f8fa; }
+
+.dark .border-slate-100 { border-color: #232331; }
+.dark .border-slate-50 { border-color: rgba(255, 255, 255, 0.06); }
+.dark .border-slate-200 { border-color: #2a2a3a; }
+.dark .border-slate-300 { border-color: #38384a; }
+.dark .ring-slate-200 { --tw-ring-color: rgba(255, 255, 255, 0.12); }
+
+.dark .bg-rose-50 { background-color: rgba(244, 63, 94, 0.12); }
+.dark .bg-rose-100 { background-color: rgba(244, 63, 94, 0.18); }
+.dark .text-rose-700 { color: #fda4af; }
+.dark .text-rose-600 { color: #fb7185; }
+.dark .text-rose-500 { color: #fb7185; }
+.dark .border-rose-300 { border-color: rgba(244, 63, 94, 0.4); }
+.dark .ring-rose-200 { --tw-ring-color: rgba(244, 63, 94, 0.3); }
+
+.dark .bg-emerald-50 { background-color: rgba(16, 185, 129, 0.12); }
+.dark .text-emerald-700 { color: #6ee7b7; }
+.dark .text-emerald-500 { color: #34d399; }
+.dark .ring-emerald-200 { --tw-ring-color: rgba(16, 185, 129, 0.3); }
+
+.dark .bg-amber-50 { background-color: rgba(245, 158, 11, 0.12); }
+.dark .bg-amber-100 { background-color: rgba(245, 158, 11, 0.18); }
+.dark .text-amber-900 { color: #fcd34d; }
+.dark .text-amber-800 { color: #fcd34d; }
+.dark .text-amber-700 { color: #fbbf24; }
+.dark .text-amber-500 { color: #fbbf24; }
+.dark .border-amber-300 { border-color: rgba(245, 158, 11, 0.4); }
+.dark .ring-amber-200 { --tw-ring-color: rgba(245, 158, 11, 0.3); }
+
+.dark .shadow-card {
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 8px 24px -8px rgba(0, 0, 0, 0.5);
 }

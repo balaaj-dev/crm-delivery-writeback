@@ -27,9 +27,15 @@ function DryRunBadge() {
   );
 }
 
+/** Runs before paint so a stored/system dark preference doesn't flash light-then-dark on load. See ThemeToggle for the write side. */
+const THEME_INIT_SCRIPT = `(function(){try{var t=localStorage.getItem('cymate-theme');if(t==='dark'||(!t&&window.matchMedia('(prefers-color-scheme: dark)').matches)){document.documentElement.classList.add('dark')}}catch(e){}})();`;
+
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
     <html lang="en" className={`${inter.variable} ${display.variable}`}>
+      <head>
+        <script dangerouslySetInnerHTML={{ __html: THEME_INIT_SCRIPT }} />
+      </head>
       <body className="min-h-screen font-sans text-slate-900">
         <header className="bg-cymate-navy">
           <div className="mx-auto flex max-w-6xl items-center justify-between px-6 py-3">

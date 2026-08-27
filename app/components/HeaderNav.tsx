@@ -3,6 +3,7 @@
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
 import { LogoutButton } from './LogoutButton';
+import { ThemeToggle } from './ThemeToggle';
 
 function NavLink({ href, children }: { href: string; children: React.ReactNode }) {
   return (
@@ -17,13 +18,20 @@ function NavLink({ href, children }: { href: string; children: React.ReactNode }
 
 export function HeaderNav({ showLogout, dryRunBadge }: { showLogout: boolean; dryRunBadge: React.ReactNode }) {
   const pathname = usePathname();
-  if (pathname === '/login') return null;
+  if (pathname === '/login') {
+    return (
+      <nav className="flex items-center gap-1">
+        <ThemeToggle />
+      </nav>
+    );
+  }
 
   return (
     <nav className="flex items-center gap-1">
       <NavLink href="/setup">Setup</NavLink>
       <NavLink href="/log">Event log</NavLink>
       {showLogout && <LogoutButton />}
+      <ThemeToggle />
       <div className="ml-3 border-l border-white/10 pl-3">{dryRunBadge}</div>
     </nav>
   );
