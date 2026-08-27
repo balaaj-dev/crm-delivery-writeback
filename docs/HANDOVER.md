@@ -286,6 +286,41 @@ Also fixed in passing: step 3's copy still said "step 10 will ask which pipeline
 deal-stage picker — stale from before the wizard steps were reordered earlier this session; the
 picker has been step 9 since then. Confirmed live the corrected copy renders.
 
+## Local live test of company/deal association, and two real bugs it found (27 Aug 2026)
+
+Balaaj asked directly whether company find/create and deal↔engagement association could be tested
+locally rather than waiting on Vercel — yes: `DRY_RUN=false` plus a synthetic POST straight to
+`/api/webhooks/smartlead` exercises the exact same code path a real webhook would, no tunnel or
+deployment needed. Three requests against a real Outspeak/HubSpot portal (cleaned up after) found:
+
+1. **`dealStageOnPositiveReply`/`dealStageOnMeetingBooked` were silently stripped on every config
+   save.** `lib/schemas.ts`'s `clientConfigSchema` never got these two fields added when they were
+   added to `lib/types.ts` earlier the same day — the exact same "z.object() strips unknown keys"
+   bug class as the 26 Aug owner-guardrail incident. Every deal since the feature shipped landed
+   with `dealstage: null, pipeline: null` despite the wizard's pickers showing real values. Fixed by
+   adding both fields to the schema (see the ownerId comment right above them for the established
+   pattern) — **whenever a field is added to `ClientConfig`, it must be added to `lib/schemas.ts` in
+   the same change, not as a follow-up.**
+2. **`writeActivity` ran before `createDeal`, so the deal-engagement association could never fire
+   for a brand-new contact's first interested reply** — the single most common real case, where one
+   dispatch call creates the record, writes the activity, *and* creates the deal. `findAssociatedDealIds`
+   found nothing because the deal didn't exist yet when it ran. Fixed by reordering `lib/dispatch.ts`
+   to create the deal before writing activity (step 7, was step 9) — confirmed live afterward:
+   `deal_to_note` associations present on all three test deals.
+
+**New, still-open finding**: on all three test runs, HubSpot ended up with **two companies** for the
+same domain — one correctly named (ours, from `findOrCreateCompany`), one with `name: null` created
+roughly a second earlier. This looks like HubSpot's own backend auto-creating a company the instant
+a contact's `website` property is set (independent of our API calls), racing our own
+`GET /crm/v3/objects/companies/{domain}?idProperty=domain` check — our GET runs before HubSpot's
+auto-created company is visible at that lookup, so we create a second one. The contact and deal
+still end up correctly associated with *our* company (not the auto-created shell), so data isn't
+wrong, just duplicated and slightly confusing in the UI. Not fixed in this pass — needs a decision
+on approach (a short retry/delay before the domain lookup; a `POST /crm/v3/objects/companies/search`
+call instead of the single-record GET; or a cleanup pass that finds and archives blank duplicate
+companies) rather than a guess. All test data (3 contacts, 6 companies, 3 deals, 3 notes) was
+deleted from the real portal after this test.
+
 ## Unresolved [VERIFY] items — confirm against live vendor docs/accounts before DRY_RUN=false
 
 | Item | Where | Status |
@@ -295,8 +330,8 @@ picker has been step 9 since then. Confirmed live the corrected copy renders.
 | ~~Smartlead webhook-registration endpoint + payload shape~~ | `lib/sources/smartlead-api.ts` `registerSmartleadWebhook` | **SUPERSEDED 27 Aug 2026.** The `POST /campaigns/{id}/webhooks` path (confirmed 26 Aug) worked, but is one webhook *per campaign* with no dedup — a real client with 8 active campaigns and several test runs accumulated 40+ duplicate webhooks in one day. Switched to `POST /webhook/create` with `association_type: 1` ("User Level"), confirmed live: one call registers a single account-wide webhook covering every campaign, present and future, and it accepts the exact same 7 event names already confirmed (including `LEAD_CATEGORY_UPDATED` — checked directly, since a different account-level webhook variant documented elsewhere in Smartlead's docs does NOT support it, which would have been a silent, serious regression). The response's `data.id.id` is the webhook's real id; `email_campaign_id: null` on read-back confirms account-wide scope. `DELETE /webhook/delete/{id}` works for webhooks created either the old or new way. **Still unverified**: what a live-fired event's actual JSON body looks like — registering successfully doesn't prove that. This has been the single biggest untested gap in this project since Milestone 2 and remains so; a documented generic example shows `{event, timestamp, campaign_id, lead: {...}, reply: {...}}`, which does NOT match this app's schema (`event_type`, `event_timestamp`, `lead_category`, etc.) — but that example is for a different, simpler webhook variant, so it may not apply here. Do not assume `lib/sources/smartlead.ts`'s parser is correct for a real payload until one has actually been received and inspected. |
 | ~~Smartlead lead-categories endpoint~~ | `lib/sources/smartlead-api.ts` `listLeadCategories` | **CONFIRMED LIVE 25 Aug 2026** against a real Lotus Labs account: `GET /leads/fetch-categories?api_key=...` returns `[{id, name, sentiment_type}]`. Real category names differ from the brief's assumed defaults — Smartlead's own default set is `Interested`, `Meeting Request` (not "Meeting Booked"), `Not Interested`, `Do Not Contact`, `Information Request`, `Out Of Office`, `Wrong Person`, plus per-workspace custom categories like `Uncategorizable by Ai`/`Sender Originated Bounce`/`Nurturing`. `DEFAULT_STATUS_MAP` in `lib/types.ts` still says "Meeting Booked" — harmless because the wizard always overwrites it with a client's live categories (step 8), but worth fixing the constant itself so nobody copies it verbatim into a real client's statusMap. |
 | HubSpot rate limits | `lib/adapters/hubspot.ts` | Not checked live. Implemented: serial requests, single 429 retry with a 1s delay, no backoff system (by design — full backoff is out of scope). |
-| ~~HubSpot company find/create (`findOrCreateCompany`)~~ | `lib/adapters/hubspot.ts` | **CONFIRMED LIVE 27 Aug 2026.** Balaaj added `crm.objects.companies.read`/`.write` to the Service Key. Confirmed directly: `GET /crm/v3/objects/companies/{domain}?idProperty=domain` now returns a genuine 404 for an unknown domain (was 403 MISSING_SCOPES before), `POST /crm/v3/objects/companies` creates a real company (verified via a real test company, created then deleted to keep the portal clean). Not yet exercised through the adapter itself end-to-end (that happens with the next live delivery run), but the underlying HTTP calls are proven. |
-| ~~HubSpot deal↔engagement association (`findAssociatedDealIds`/`associateEngagementWithDeals`)~~ | `lib/adapters/hubspot.ts` | **Read side CONFIRMED LIVE 27 Aug 2026**: `GET /crm/v4/objects/contacts/{id}/associations/deals` returns real results against a contact with an existing deal from an earlier test run. The write side (`PUT .../associations/default/deals/{id}` on an email/note) uses the identical default-association pattern already confirmed live for contacts and companies, so it's expected to work, but hasn't been separately fired — will be proven by the next live delivery/webhook run. |
+| ~~HubSpot company find/create (`findOrCreateCompany`)~~ | `lib/adapters/hubspot.ts` | **CONFIRMED LIVE end-to-end 27 Aug 2026** via three real synthetic webhook POSTs to the actual `/api/webhooks/smartlead` route (DRY_RUN=false, real Outspeak HubSpot portal, cleaned up after). Company created, dealstage/pipeline set correctly, contact↔company and deal↔company associations all confirmed via direct API reads. See "Duplicate company on new-contact creation" below for a real issue this surfaced. |
+| ~~HubSpot deal↔engagement association (`findAssociatedDealIds`/`associateEngagementWithDeals`)~~ | `lib/adapters/hubspot.ts` | **CONFIRMED LIVE end-to-end 27 Aug 2026**, same three-request test. Required a real fix first — see "Deal created after activity written" below; once fixed, `deal_to_note` associations confirmed via direct API reads on all three test deals. |
 
 **What WAS confirmed live** (via HubSpot's/Smartlead's public docs and, for HubSpot, an actual
 test portal — see the section above — so worth recording rather than re-checking):
@@ -358,8 +393,13 @@ upgrade Next.
   URL — needs a second deploy pass once known), `SETUP_AUTH_USER`/`SETUP_AUTH_PASS` (genuinely
   needed now — see below), `CONFIG_ENCRYPTION_KEY` (generated this pass, see chat history — do not
   regenerate, or already-encrypted session data becomes unreadable).
-- `middleware.ts`'s HTTP Basic Auth gate and `lib/crypto.ts`'s credential encryption are both
-  built but still **inactive** in every environment as of this pass — neither `SETUP_AUTH_USER`/
-  `PASS` nor `CONFIG_ENCRYPTION_KEY` is set anywhere yet, including locally. This was a reasonable
-  default while everything ran on localhost; it stops being reasonable the moment this is reachable
-  from the public internet on Vercel. Do not leave a deployed instance running without both set.
+- `middleware.ts`'s HTTP Basic Auth gate and `lib/crypto.ts`'s credential encryption are now
+  **active locally** (27 Aug 2026, per Balaaj: "that's our responsibility, not Kenley's") — both
+  set in `.env.local` and confirmed live: unauthenticated requests get a real 401 with the right
+  `WWW-Authenticate` header, the Smartlead webhook route stays correctly exempt, valid credentials
+  work, and a fresh config save lands on disk with the `enc:v1:` prefix (a stale pre-encryption
+  entry in `data/client-overrides.json` confirmed this wasn't a false positive — only *new* writes
+  are encrypted, existing plaintext entries stay as-is until next written). The same
+  `SETUP_AUTH_USER`/`PASS`/`CONFIG_ENCRYPTION_KEY` values need to be set on Vercel too — see chat
+  history for the actual values, do not regenerate `CONFIG_ENCRYPTION_KEY` independently or
+  already-encrypted local data becomes unreadable.

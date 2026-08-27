@@ -126,19 +126,14 @@ export async function dispatchEvent(
       actions.push('created_record');
     }
 
-    // 7. write activity
-    await adapter.writeActivity(ref, event, cfg);
-    actions.push('wrote_activity');
-
-    // 8. status map
-    const category = event.detail.category;
-    const statusValue = category ? cfg.statusMap[category] : undefined;
-    if (statusValue) {
-      await adapter.updateStatus(ref, statusValue, cfg);
-      actions.push(`updated_status:${statusValue}`);
-    }
-
-    // 9. deal creation
+    // 7. deal creation — moved ahead of write activity (was step 9) on
+    // 27 Aug 2026: a real live test showed a brand-new contact's first
+    // interested reply creates the record, writes the activity, *then*
+    // creates the deal — so writeActivity's deal-engagement association
+    // (see hubspot.ts's findAssociatedDealIds) never found a deal, because
+    // it didn't exist yet. Creating the deal first means the single most
+    // common case (new contact + interested reply, both created in the
+    // same dispatch call) actually gets its activity linked to the deal.
     if (
       cfg.behaviour.createDeal &&
       (effectiveType === 'positive_reply' || effectiveType === 'meeting_booked') &&
@@ -148,6 +143,18 @@ export async function dispatchEvent(
       await adapter.createDeal(ref, event, cfg, effectiveType);
       dealsCreatedForRef.add(ref.id);
       actions.push('created_deal');
+    }
+
+    // 8. write activity
+    await adapter.writeActivity(ref, event, cfg);
+    actions.push('wrote_activity');
+
+    // 9. status map
+    const category = event.detail.category;
+    const statusValue = category ? cfg.statusMap[category] : undefined;
+    if (statusValue) {
+      await adapter.updateStatus(ref, statusValue, cfg);
+      actions.push(`updated_status:${statusValue}`);
     }
 
     // 10. log success

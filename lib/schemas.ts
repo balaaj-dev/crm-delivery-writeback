@@ -47,6 +47,13 @@ export const clientConfigSchema = z.object({
     createRecordForAllLeads: z.boolean(),
     createDeal: z.boolean(),
     dealStageOnCreate: z.string().optional(),
+    // Same silent-strip bug as ownerId below, found live 27 Aug 2026: added
+    // to lib/types.ts's ClientConfig on 27 Aug for the "two separate stage
+    // pickers" feature, but never added here — every config save since then
+    // has silently dropped both, so every deal landed with dealstage: null,
+    // pipeline: null regardless of what the wizard's pickers showed.
+    dealStageOnPositiveReply: z.string().optional(),
+    dealStageOnMeetingBooked: z.string().optional(),
     planLimitAcknowledged: z.boolean(),
     // Optional at the schema level so existing/pre-owner-guardrail configs
     // still parse — actually *requiring* it for a config that's allowed to

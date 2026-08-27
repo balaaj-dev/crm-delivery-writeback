@@ -44,6 +44,17 @@ const smartleadLeadSchema = z.object({
   job_title: z.string().optional(),
   linkedin_url: z.string().optional(),
   phone_number: z.string().optional(),
+  /**
+   * Added 27 Aug 2026 — found by tracing, not by seeing a real payload
+   * (still genuinely unverified, see HANDOVER.md): without this, the
+   * webhook path never populated prospect.domain, so findOrCreateCompany
+   * would only ever fire from bulk delivery (which reads this from
+   * Smartlead's REST API, confirmed live) and never from a real-time
+   * webhook-triggered reply/deal. Optional, so a real payload without this
+   * field still parses fine — company creation just no-ops for that event,
+   * same graceful-degradation pattern as everywhere else.
+   */
+  website: z.string().optional(),
 });
 
 export const smartleadWebhookPayloadSchema = z.object({
@@ -130,6 +141,7 @@ export function mapSmartleadEventToCanonical(
       title: payload.lead.job_title,
       linkedinUrl: payload.lead.linkedin_url,
       phone: payload.lead.phone_number,
+      domain: payload.lead.website,
     },
     detail: {
       sequenceStep: payload.sequence_number,

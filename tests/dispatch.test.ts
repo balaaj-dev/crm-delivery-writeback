@@ -188,9 +188,14 @@ describe('dispatchEvent — error handling', () => {
 
   it('preserves actions and ref that succeeded before a later step failed', async () => {
     // Regression test for a real bug found testing against live HubSpot:
-    // deal creation failed on a missing scope *after* the contact was
-    // already created and the note already written — the error outcome
-    // must not lose that.
+    // a later step failed *after* the contact was already created — the
+    // error outcome must not lose that. Simulates writeActivity failing,
+    // not createDeal — deal creation moved ahead of write activity on
+    // 27 Aug 2026 (see dispatch.ts step 7's comment: a live test showed
+    // writeActivity's deal-engagement association never found a deal when
+    // it ran before the deal existed), so createDeal is now the step that
+    // succeeds first, and writeActivity is the "later step" that can fail
+    // after real progress was made.
     const cfg = baseConfig({
       behaviour: {
         createRecordOnInterestedReply: true,
@@ -201,8 +206,8 @@ describe('dispatchEvent — error handling', () => {
     });
     const partiallyFailingAdapter = {
       ...mockAdapter,
-      createDeal: async () => {
-        throw new Error('MISSING_SCOPES: crm.objects.deals.write');
+      writeActivity: async () => {
+        throw new Error('MISSING_SCOPES: crm.objects.notes.write');
       },
     };
     const outcome = await dispatchEvent(
@@ -214,8 +219,8 @@ describe('dispatchEvent — error handling', () => {
     if (outcome.status === 'error') {
       expect(outcome.reason).toContain('MISSING_SCOPES');
       expect(outcome.actions).toContain('created_record');
-      expect(outcome.actions).toContain('wrote_activity');
-      expect(outcome.actions).not.toContain('created_deal');
+      expect(outcome.actions).toContain('created_deal');
+      expect(outcome.actions).not.toContain('wrote_activity');
       expect(outcome.ref).toBeDefined();
     }
   });
