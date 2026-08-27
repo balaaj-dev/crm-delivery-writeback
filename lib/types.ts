@@ -140,6 +140,15 @@ export interface ClientConfig {
      * security check on the incoming webhook").
      */
     webhookSecret?: string;
+    /**
+     * Smartlead's own id for the single account-wide webhook registered for
+     * this client (see lib/sources/smartlead-api.ts's registerSmartleadWebhook).
+     * Tracked so re-registering (e.g. clicking "Review and build" again)
+     * can skip creating a duplicate instead of piling up more — a real
+     * incident (27 Aug 2026) produced 40+ duplicate webhooks for one client
+     * before this existed.
+     */
+    smartleadWebhookId?: number;
   };
 
   crm: {

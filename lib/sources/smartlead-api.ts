@@ -274,49 +274,65 @@ export async function resolveInterestCategoryIds(
 }
 
 /**
- * Registers exactly the 7 approved events (brief §6) for one campaign.
- * Never pass EMAIL_OPEN or EMAIL_LINK_CLICK here — see brief §2.3 and
- * lib/sources/smartlead.ts's FORBIDDEN_EVENT_TYPES guard, which this call
- * cannot bypass even if asked to.
+ * Registers exactly the 7 approved events (brief §6) for a client's entire
+ * Smartlead account in one call — not per campaign. Never pass EMAIL_OPEN
+ * or EMAIL_LINK_CLICK here — see brief §2.3 and lib/sources/smartlead.ts's
+ * FORBIDDEN_EVENT_TYPES guard, which this call cannot bypass even if asked.
  *
- * Path/method CONFIRMED live, 26 Aug 2026 (real Lotus Labs account,
- * real wizard run): every attempt failed with a 400 whose body was
- * `{"message":"\"name\" is required","validation":{"source":"body","keys":["name"]}}`
- * — a genuine, previously-unconfirmed requirement, not a guess. `name`
- * added below; still worth a supervised re-test to confirm 200s land
- * before relying on this for a real client's live sync.
+ * Real incident this replaces (27 Aug 2026): the original implementation
+ * called `POST /campaigns/{id}/webhooks` once per campaign, and did so
+ * again on every "Review and build" click with no dedup — a single client
+ * with 8 active campaigns and a handful of test runs accumulated 40+
+ * duplicate webhooks, all named identically, impossible to tell apart.
+ * Confirmed live there's a real account-level alternative:
+ * `POST /webhook/create` with `association_type: 1` ("User Level" —
+ * Smartlead's own term for account-wide) registers ONE webhook that
+ * receives events from every campaign, present and future. Verified this
+ * accepts the exact same 7 event names already confirmed against the
+ * per-campaign endpoint (including LEAD_CATEGORY_UPDATED, which a
+ * different, more limited account-level webhook variant documented
+ * elsewhere in Smartlead's docs does NOT support — checked directly by
+ * registering with it live and reading the event_type_map back unchanged).
+ * Same real payload-shape caveat as before: registering successfully
+ * doesn't confirm what a live-fired event's JSON body looks like — that's
+ * still genuinely unverified, unrelated to which endpoint registers it.
  */
 export async function registerSmartleadWebhook(
   apiKey: string,
-  campaignId: string,
   targetUrl: string,
-): Promise<{ ok: boolean; message: string }> {
-  const url = new URL(`${SMARTLEAD_API_BASE}/campaigns/${campaignId}/webhooks`);
+): Promise<{ ok: boolean; message: string; webhookId?: number }> {
+  const url = new URL(`${SMARTLEAD_API_BASE}/webhook/create`);
   url.searchParams.set('api_key', apiKey);
+
+  const eventTypeMap = Object.fromEntries(SMARTLEAD_EVENT_TYPES.map((t) => [t, true]));
 
   const res = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       name: 'Cymate CRM Writeback',
-      // Never EMAIL_OPEN / EMAIL_LINK_CLICK — see brief §2.3.
-      event_types: SMARTLEAD_EVENT_TYPES,
       webhook_url: targetUrl,
+      association_type: 1, // User Level — account-wide, not tied to one campaign.
+      // Never EMAIL_OPEN / EMAIL_LINK_CLICK — see brief §2.3.
+      event_type_map: eventTypeMap,
     }),
   });
 
   if (!res.ok) {
     const detail = await res.text();
-    logger.warn('smartlead webhook registration failed — endpoint shape is unverified', {
-      campaignId,
-      status: res.status,
-      detail,
-    });
-    return {
-      ok: false,
-      message: `[VERIFY] Registration call failed (${res.status}). This endpoint is unconfirmed — see docs/HANDOVER.md. ${detail}`,
-    };
+    logger.warn('smartlead account-level webhook registration failed', { status: res.status, detail });
+    return { ok: false, message: `Registration call failed (${res.status}). ${detail}` };
   }
 
-  return { ok: true, message: 'Webhook registration call succeeded (verify event list in Smartlead UI).' };
+  const body = (await res.json()) as { data?: { id?: { id?: number } } };
+  const webhookId = body.data?.id?.id;
+  return { ok: true, message: 'Account-wide webhook registered.', webhookId };
+}
+
+/** Cleanup helper — same DELETE endpoint works for webhooks created either the old (per-campaign) or new (account-level) way. */
+export async function deleteSmartleadWebhook(apiKey: string, webhookId: number): Promise<boolean> {
+  const url = new URL(`${SMARTLEAD_API_BASE}/webhook/delete/${webhookId}`);
+  url.searchParams.set('api_key', apiKey);
+  const res = await fetch(url, { method: 'DELETE' });
+  return res.ok;
 }

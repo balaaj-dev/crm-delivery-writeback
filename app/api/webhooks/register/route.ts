@@ -1,24 +1,29 @@
 import { NextResponse } from 'next/server';
 import { randomBytes } from 'node:crypto';
 import { getClientConfig, setSessionOverride } from '@/lib/config';
-import { registerSmartleadWebhook, listCampaigns } from '@/lib/sources/smartlead-api';
+import { registerSmartleadWebhook } from '@/lib/sources/smartlead-api';
 import { logger } from '@/lib/log';
 
 /**
- * Register the 7 approved webhook events for every in-scope campaign.
+ * Register the 7 approved webhook events for a client's entire Smartlead
+ * account — one webhook, not one per campaign. Rewritten 27 Aug 2026:
+ * the previous version registered once per campaign and had no dedup, so
+ * repeated "Review and build" clicks piled up duplicates (one real client
+ * accumulated 40+ identical webhooks). Smartlead's account-level
+ * registration (`association_type: 1`) makes the whole per-campaign loop
+ * unnecessary — confirmed live it still supports every event this app
+ * needs, including LEAD_CATEGORY_UPDATED. See lib/sources/smartlead-api.ts
+ * for the full story.
  *
- * Fixed 26 Aug 2026 (Jairo's feedback made this a real gap, not a
- * theoretical one): the "sync only PRs" / "sync all contacts" sync-scope
- * options deliberately leave source.campaignIds empty — that's the whole
- * point of the new "everything" option skipping campaign selection. This
- * used to hard-refuse registration whenever campaignIds was empty; it now
- * falls back to every campaign currently in the client's Smartlead account.
+ * Idempotent: if this client already has a tracked smartleadWebhookId,
+ * this is a no-op rather than creating another one — the webhook already
+ * covers every campaign, present and future, so there's nothing to redo.
  *
- * Also now generates and persists a per-client webhook secret (embedded in
- * the registered URL as ?secret=...) if the client doesn't already have
- * one — see app/api/webhooks/smartlead/route.ts, which rejects any call
- * that doesn't present it. Smartlead doesn't document a request-signing
- * scheme to verify against, so this is the shared-secret alternative.
+ * Also generates and persists a per-client webhook secret (embedded in the
+ * registered URL as ?secret=...) if the client doesn't already have one —
+ * see app/api/webhooks/smartlead/route.ts, which rejects any call that
+ * doesn't present it. Smartlead doesn't document a request-signing scheme
+ * to verify against, so this is the shared-secret alternative.
  */
 export async function POST(req: Request) {
   const body = (await req.json().catch(() => ({}))) as { clientId?: string };
@@ -33,43 +38,31 @@ export async function POST(req: Request) {
     });
   }
 
-  const webhookSecret = cfg.source.webhookSecret ?? randomBytes(24).toString('hex');
-  if (!cfg.source.webhookSecret) {
-    await setSessionOverride({ ...cfg, source: { ...cfg.source, webhookSecret } });
+  if (cfg.source.smartleadWebhookId) {
+    return NextResponse.json({
+      ok: true,
+      message: `Already registered (webhook ${cfg.source.smartleadWebhookId}) — covers every campaign in this account, nothing to redo.`,
+      webhookId: cfg.source.smartleadWebhookId,
+    });
   }
 
+  const webhookSecret = cfg.source.webhookSecret ?? randomBytes(24).toString('hex');
   const baseUrl = process.env.PUBLIC_BASE_URL ?? 'http://localhost:3000';
   const targetUrl =
     `${baseUrl}/api/webhooks/smartlead?clientId=${encodeURIComponent(cfg.clientId)}` +
     `&secret=${encodeURIComponent(webhookSecret)}`;
 
-  let campaignIds = cfg.source.campaignIds ?? [];
-  if (campaignIds.length === 0) {
-    try {
-      const campaigns = await listCampaigns(cfg.source.apiKey);
-      campaignIds = campaigns.map((c) => c.id);
-    } catch (err) {
-      return NextResponse.json({
-        ok: false,
-        message: `No campaigns selected and couldn't list the account's campaigns to fall back to: ${err instanceof Error ? err.message : err}`,
-      });
-    }
-    if (campaignIds.length === 0) {
-      return NextResponse.json({
-        ok: false,
-        message: "This client's Smartlead account has no campaigns to register webhooks against yet.",
-      });
-    }
+  const result = await registerSmartleadWebhook(cfg.source.apiKey, targetUrl);
+
+  if (!result.ok) {
+    logger.warn('smartlead account-level webhook registration failed', { clientId: cfg.clientId, result });
+    return NextResponse.json({ ok: false, targetUrl, message: result.message });
   }
 
-  const results = await Promise.all(
-    campaignIds.map((campaignId) => registerSmartleadWebhook(cfg.source.apiKey, campaignId, targetUrl)),
-  );
+  await setSessionOverride({
+    ...cfg,
+    source: { ...cfg.source, webhookSecret, smartleadWebhookId: result.webhookId },
+  });
 
-  const allOk = results.every((r) => r.ok);
-  if (!allOk) {
-    logger.warn('smartlead webhook registration had failures', { clientId: cfg.clientId, results });
-  }
-
-  return NextResponse.json({ ok: allOk, targetUrl, campaignCount: campaignIds.length, results });
+  return NextResponse.json({ ok: true, targetUrl, webhookId: result.webhookId, message: result.message });
 }

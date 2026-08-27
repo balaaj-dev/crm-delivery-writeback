@@ -33,6 +33,7 @@ export const clientConfigSchema = z.object({
     smartleadClientId: z.string().optional(),
     campaignIds: z.array(z.string()).optional(),
     webhookSecret: z.string().optional(),
+    smartleadWebhookId: z.number().optional(),
   }),
 
   crm: z.object({
