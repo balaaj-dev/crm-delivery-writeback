@@ -62,3 +62,32 @@ export async function kvGetAllByPrefix<T>(prefix: string): Promise<Record<string
   });
   return result;
 }
+
+/**
+ * Atomically sets key only if it doesn't already exist, with a TTL — used
+ * for idempotency claims (lib/idempotency.ts). Returns true if this call
+ * newly claimed it (first time), false if it already existed (a duplicate).
+ * Callers check kvAvailable() first; if somehow called without a client,
+ * fails open (returns true / "go ahead") rather than silently blocking
+ * every event, consistent with this app's other safety defaults.
+ */
+export async function kvSetNX(key: string, value: unknown, ttlSeconds: number): Promise<boolean> {
+  const c = getClient();
+  if (!c) return true;
+  const result = await c.set(key, value, { nx: true, ex: ttlSeconds });
+  return result === 'OK';
+}
+
+/** Push a value onto the head of a list, then trim it to maxLen — used for the KV-backed event log and raw-webhook capture (both bounded, newest-first lists). */
+export async function kvListPush<T>(key: string, value: T, maxLen: number): Promise<void> {
+  const c = getClient();
+  if (!c) return;
+  await c.lpush(key, value);
+  await c.ltrim(key, 0, maxLen - 1);
+}
+
+export async function kvListRange<T>(key: string, start: number, stop: number): Promise<T[]> {
+  const c = getClient();
+  if (!c) return [];
+  return (await c.lrange<T>(key, start, stop)) ?? [];
+}

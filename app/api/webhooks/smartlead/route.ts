@@ -3,7 +3,7 @@ import { getClientConfig } from '@/lib/config';
 import { smartleadWebhookPayloadSchema, mapSmartleadEventToCanonical } from '@/lib/sources/smartlead';
 import { dispatchEvent } from '@/lib/dispatch';
 import { getAdapterForClient } from '@/lib/adapters/index';
-import { logger } from '@/lib/log';
+import { logger, recordRawWebhookPayload } from '@/lib/log';
 
 /**
  * Ingestion endpoint for the 7 approved Smartlead webhook events (brief §6).
@@ -48,6 +48,19 @@ export async function POST(req: Request) {
   }
 
   const parsed = smartleadWebhookPayloadSchema.safeParse(body);
+
+  // Captured regardless of validation outcome, but only once the secret
+  // check above has passed — this is the exact raw shape Smartlead sent,
+  // kept so a schema mismatch can actually be diagnosed. See
+  // lib/log.ts's recordRawWebhookPayload for why this exists.
+  await recordRawWebhookPayload({
+    timestamp: new Date().toISOString(),
+    clientId,
+    valid: parsed.success,
+    validationIssues: parsed.success ? undefined : parsed.error.issues,
+    body,
+  });
+
   if (!parsed.success) {
     logger.warn('smartlead webhook: payload failed validation', {
       clientId,

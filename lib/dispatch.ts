@@ -16,9 +16,10 @@ import type {
   CrmRecordRef,
   DispatchOutcome,
 } from './types';
-import { hasBeenProcessed, markProcessed } from './idempotency';
+import { tryClaimEvent } from './idempotency';
 import { recordEvent } from './log';
 import { isDryRun } from './adapters/index';
+import { kvAvailable, kvGet, kvSet } from './kv';
 
 /** category/status-map values that, when matched, promote a status_change event to that type. */
 const PROMOTABLE_TYPES: CanonicalEventType[] = ['positive_reply', 'meeting_booked'];
@@ -44,11 +45,29 @@ export function resolveEffectiveEventType(
   return event.type;
 }
 
-// Tracks which CRM record refs have already had a deal created in this
-// process, so a repeated positive_reply/meeting_booked doesn't spawn a
-// second deal. Resets on cold start — same limitation as idempotency.ts,
-// documented in docs/HANDOVER.md; production needs a persistent store.
+// Tracks which CRM record refs have already had a deal created, so a
+// repeated positive_reply/meeting_booked doesn't spawn a second deal.
+// Backed by KV (permanent — no TTL, since this should hold for the life of
+// the CRM record, not just a retry window) when available, same fallback
+// pattern as idempotency.ts. Not atomic (a get then a later set) — an
+// acceptable trade-off since colliding on this would require two literally
+// concurrent dispatches for the same brand-new contact's first positive
+// signal, which is far rarer than the webhook-redelivery case idempotency.ts
+// guards against.
 const dealsCreatedForRef = new Set<string>();
+
+async function hasCreatedDealFor(refId: string): Promise<boolean> {
+  if (kvAvailable()) return (await kvGet<boolean>(`deal-created:${refId}`)) === true;
+  return dealsCreatedForRef.has(refId);
+}
+
+async function markDealCreatedFor(refId: string): Promise<void> {
+  if (kvAvailable()) {
+    await kvSet(`deal-created:${refId}`, true);
+    return;
+  }
+  dealsCreatedForRef.add(refId);
+}
 
 /** Test-only escape hatch so unit tests get a clean store per test. */
 export function resetDealDedupeStore(): void {
@@ -92,11 +111,10 @@ export async function dispatchEvent(
   }
 
   // 4. idempotency
-  if (hasBeenProcessed(event.eventId)) {
+  if (!(await tryClaimEvent(event.eventId))) {
     await recordEvent({ ...baseLog, outcome: 'skip', reason: 'duplicate' });
     return { status: 'skip', reason: 'duplicate' };
   }
-  markProcessed(event.eventId);
 
   // Declared outside the try block so the catch below can report whatever
   // succeeded before a later step failed, instead of losing it — see the
@@ -138,10 +156,10 @@ export async function dispatchEvent(
       cfg.behaviour.createDeal &&
       (effectiveType === 'positive_reply' || effectiveType === 'meeting_booked') &&
       adapter.createDeal &&
-      !dealsCreatedForRef.has(ref.id)
+      !(await hasCreatedDealFor(ref.id))
     ) {
       await adapter.createDeal(ref, event, cfg, effectiveType);
-      dealsCreatedForRef.add(ref.id);
+      await markDealCreatedFor(ref.id);
       actions.push('created_deal');
     }
 
