@@ -86,18 +86,32 @@ added afterward at Balaaj's request, once writeback was proven against a real Hu
 
 ## Known architectural limitations (accepted for this milestone)
 
-- **In-memory idempotency** (`lib/idempotency.ts`). The processed-event `Map` resets on cold
-  start. On Vercel serverless, a duplicate webhook delivery can get reprocessed if it lands on a
-  fresh instance. Production needs a persistent store (Redis, a database row, whatever the
-  eventual platform already has).
-- **In-memory + best-effort file event log** (`lib/log.ts`). Same story — the in-memory array is
-  the source of truth for `/log` within one running instance; the JSON-lines file mirror is a
-  local-dev convenience and silently no-ops on a read-only filesystem (e.g. Vercel). Production
-  needs a real log sink.
-- **In-memory deal-creation dedupe** (`lib/dispatch.ts`'s `dealsCreatedForRef`). Same limitation —
-  resets on cold start, so a repeated positive signal after a cold start could create a second
-  deal. No CRM-side "does a deal already exist" check exists in the `CrmAdapter` interface; that
-  would need to be added if this becomes a real requirement.
+- ~~In-memory idempotency, event log, and deal-creation dedupe~~ — **FIXED 28 Aug 2026.** All
+  three (`lib/idempotency.ts`, `lib/log.ts`'s event log, `lib/dispatch.ts`'s `dealsCreatedForRef`)
+  used to be plain in-memory state that reset on every Vercel cold start — a duplicate webhook
+  delivery landing on a fresh instance could get reprocessed or create a second deal, and `/log`
+  could look empty right after a real event actually ran. All three now persist to Upstash Redis
+  (same `lib/kv.ts` connection as `lib/config.ts`/`lib/jobs.ts`) when `KV_REST_API_URL`/`TOKEN` are
+  set, with the exact same in-memory fallback for local dev/tests where they aren't. Idempotency
+  specifically got a correctness upgrade beyond just persistence: it's now one atomic Redis `SET
+  NX` + TTL call (`kvSetNX`) instead of a separate check-then-mark, closing a real (if narrow) race
+  window where two concurrent deliveries of the same webhook could both pass the check before
+  either recorded it. Deal dedupe has no TTL (permanent key) since it should hold for the life of
+  the CRM record, not just a retry window; idempotency uses a 7-day TTL.
+- **Still no CRM-side "does a deal already exist" check** in the `CrmAdapter` interface — the
+  dedupe above is this app's own bookkeeping, not a query against HubSpot itself. Would need
+  adding if the KV-backed dedupe key were ever lost or cleared.
+- **No live-verified real Smartlead webhook payload, still** — but the gap in how we'd respond to
+  one is smaller now. `app/api/webhooks/smartlead/route.ts` captures the exact raw body of every
+  call that passes the per-client secret check (valid or not) via `lib/log.ts`'s
+  `recordRawWebhookPayload`, viewable at `/api/diagnostics/raw-webhooks` (behind the normal auth
+  gate — deliberately not under `/api/webhooks/smartlead`, which middleware.ts excludes from auth
+  entirely). Previously, a real payload that didn't match the assumed schema left nothing to fix
+  the parser against beyond a list of validation issues. Still need an actual live event to land —
+  see the chat history around 28 Aug 2026 for what was tried (Cymate's own test Smartlead account,
+  reachable via this session's MCP connection, had no webhook delivery history on its test
+  campaigns to retrigger) and what's left: either a real reply/bounce on an activated real client,
+  or checking whether Smartlead's own dashboard has a manual "send test event" option.
 - **Credentials in Airtable.** `🔁 CRM Credentials` is a plaintext long-text field. That is fine
   for a skeleton, not for production. A real secret store (e.g. a vault, or Vercel encrypted env
   vars per client) is real work for whoever integrates this into Akaiza.
@@ -167,13 +181,17 @@ so `qstashAvailable()` is false, so `startDeliveryJob` falls through to the orig
 `runJob` loop — ran a real job against Outspeak's campaign 3845003 after the refactor, completed
 correctly (`status: "completed"`, same skip/create counts as before the change).
 
-**Not yet verified live**: the actual QStash path itself. Needs the Upstash QStash Marketplace
-integration connected on Vercel (same account as the Redis integration, separate connection step)
-before `QSTASH_TOKEN`/`QSTASH_CURRENT_SIGNING_KEY`/`QSTASH_NEXT_SIGNING_KEY` exist to test against —
-not connected as of this write-up. Once connected, verify by starting a real delivery job on the
-Vercel deployment and confirming it actually reaches `"completed"` (not stuck at `"queued"` or
-`"running"` the way the pre-fix job did) — same test used to confirm the persistence-only fix wasn't
-enough on its own.
+**Confirmed live 27 Aug 2026**, same day, once the Upstash QStash Marketplace integration was
+connected on Vercel. First check was a stuck job from before the fix: resuming it moved its offset
+from 5 to 185 in roughly 6–8 seconds — each chunk genuinely running as a fresh, un-frozen function
+instance instead of the single frozen one that had been stuck at offset 5 indefinitely. Confirmed
+again live during the actual Jairo demo the same day: a real delivery run against a real HubSpot
+portal (DRY_RUN=false) reached `"completed"`, with 1 contact created, 1 deal created, and 5
+activities logged — the exact failure mode this fix targets (jobs stuck at `"queued"`/`"running"`
+forever) did not recur. `PUBLIC_BASE_URL` needing to be Vercel env type "Config" (not "Secret" —
+see the Vercel-quirk note elsewhere in this doc) was a real blocker hit and fixed along the way;
+once fixed, chunk hand-off was fast enough that a multi-hundred-lead campaign that used to hang
+indefinitely completed within seconds.
 
 ## Design decision: how DRY_RUN actually routes calls (deviates from a literal reading of brief §11)
 
@@ -398,10 +416,15 @@ test portal — see the section above — so worth recording rather than re-chec
 
 ## Unresolved [ASK] items (brief §18) — do not guess, confirm with Balaaj/Jairo
 
-1. **HubSpot status field** — should `updateStatus` drive `lifecyclestage`, `hs_lead_status`, or
-   the custom `cymate_writeback_status` property this skeleton defaults to? The brief's own
-   stated preference is a custom property "so we never fight their marketing automation" — that
-   default is what's implemented, but it is still unconfirmed as a final decision.
+1. ~~**HubSpot status field**~~ — **RESOLVED 28 Aug 2026.** Balaaj's call: `hs_lead_status` (a
+   standard field, not the custom `cymate_writeback_status` property this used to default to),
+   specifically because every client's HubSpot account is configured differently — a standard
+   field needs no per-portal setup, where a custom property's label/group/existence was all
+   portal-specific. Implemented in `lib/adapters/hubspot.ts`: since `hs_lead_status` is an
+   enumeration property, `ensureLeadStatusOption` adds a client's statusMap value as a new option
+   before writing it, the first time that value is used per portal. **Not yet confirmed live** —
+   see that function's own comment for exactly what's unverified before trusting this for a real
+   client.
 2. **Airtable credentials** — who provisions the real `AIRTABLE_API_KEY` (personal access token
    scoped to base `applraTn50dXBSMrM`), Balaaj or Kenley.
 3. **Demo client** — which real client record to use for a live walkthrough once the §5.2 fields

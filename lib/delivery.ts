@@ -84,7 +84,7 @@ function leadToSyntheticEvent(lead: SmartleadLead, clientId: string): CanonicalE
   };
 }
 
-/** Smartlead's raw sequence status -> a value cymate_writeback_status can hold. Just lowercased, kept literal — not a real category, don't conflate with the statusMap's positive_reply/meeting_booked promotions. */
+/** Smartlead's raw sequence status -> a value the adapter's status field (hs_lead_status for HubSpot) can hold. Just lowercased, kept literal — not a real category, don't conflate with the statusMap's positive_reply/meeting_booked promotions. */
 function deliveryStatusValue(lead: SmartleadLead): string | undefined {
   return lead.sequenceStatus ? `delivered_${lead.sequenceStatus.toLowerCase()}` : undefined;
 }

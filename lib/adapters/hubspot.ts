@@ -40,20 +40,34 @@ import { logger } from '../log';
 const HUBSPOT_API_BASE = 'https://api.hubapi.com';
 
 /**
- * The custom property this adapter writes lifecycle/status updates to. It
- * does not exist by default on any portal — confirmed live (25 Aug 2026):
- * the first PATCH against a fresh portal failed with PROPERTY_DOESNT_EXIST.
- * `updateStatus` below self-heals by creating it on first use per portal,
- * so no manual HubSpot setup step is required per client.
+ * The property this adapter writes lifecycle/status updates to.
  *
- * Open item (brief §18.1, still genuinely unresolved — ask Balaaj, do not
- * guess): should status updates instead drive `lifecyclestage` or
- * `hs_lead_status` — HubSpot's own native fields — instead of this custom
- * property? The brief's own recommendation is a custom property "so we
- * never fight their marketing automation" — that is the default
- * implemented here. Confirm before relying on this for a real client.
+ * Changed 28 Aug 2026 (Balaaj's decision on brief §18.1's open question):
+ * `hs_lead_status` — a standard HubSpot property that exists on every
+ * portal — not the custom `cymate_writeback_status` property this used to
+ * default to. Reasoning: every HubSpot account is configured differently,
+ * so a custom property's existence, label, and group are all
+ * portal-specific setup that would otherwise need repeating per client;
+ * `hs_lead_status` gives one consistent, standard field across every
+ * client without asking anyone to set anything up by hand.
+ *
+ * `hs_lead_status` is an enumeration (dropdown) property, not free text —
+ * unlike the old custom property, HubSpot only accepts values already
+ * present in its options list. `ensureLeadStatusOption` below adds a
+ * client's statusMap value as a new option before writing it, the first
+ * time that exact value is used per portal, same self-healing shape as the
+ * old property-creation logic it replaces.
+ *
+ * NOT YET CONFIRMED LIVE (unlike the rest of this adapter, which is — see
+ * file header): writing an arbitrary custom string to `hs_lead_status` via
+ * PATCH, and the exact shape of the error HubSpot returns for an
+ * unrecognized option value. `ensureLeadStatusOption` avoids needing to
+ * parse that error at all by checking and adding the option proactively,
+ * but verify the end-to-end write against a real portal before trusting
+ * this for a real client, the same way the old property-creation self-heal
+ * was verified before it was trusted.
  */
-const CYMATE_STATUS_PROPERTY = 'cymate_writeback_status';
+const HUBSPOT_LEAD_STATUS_PROPERTY = 'hs_lead_status';
 
 class HubspotApiError extends Error {
   constructor(
@@ -204,33 +218,65 @@ function fieldMapValue(event: CanonicalEvent, canonicalPath: string): string | u
   return typeof value === 'string' ? value : undefined;
 }
 
+interface HubspotPropertyOption {
+  label: string;
+  value: string;
+  displayOrder?: number;
+  hidden?: boolean;
+}
+
 /**
- * Creates CYMATE_STATUS_PROPERTY as a plain single-line text property if it
- * doesn't already exist on this portal. Text, not an enum, because status
- * values come from the client's own statusMap (brief §7.5) and are
- * open-ended per client — see fixtures/clients.json for examples like
- * "positive_reply", "nurture", "closed_lost".
+ * A per-process cache of which (portal, value) pairs are already known to
+ * exist as hs_lead_status options — avoids a GET before every single
+ * updateStatus call once a value's been confirmed once. Resets on cold
+ * start; worst case on a miss is one redundant GET, not a correctness
+ * issue (ensureLeadStatusOption itself re-checks against the real API,
+ * this is purely an optimization).
  */
-async function ensureCymateStatusProperty(cfg: ClientConfig): Promise<void> {
-  const res = await hubspotFetch(cfg, '/crm/v3/properties/contacts', {
-    method: 'POST',
-    body: JSON.stringify({
-      name: CYMATE_STATUS_PROPERTY,
-      label: 'Cymate writeback status',
-      type: 'string',
-      fieldType: 'text',
-      groupName: 'contactinformation',
-      description:
-        "Status value written by Cymate's CRM writeback service, driven by the client's Smartlead lead-category mapping.",
-    }),
-  });
-  // 409 = another concurrent request already created it — not an error.
-  if (!res.ok && res.status !== 409) {
+const knownLeadStatusOptions = new Set<string>();
+
+/**
+ * Status values come from each client's own statusMap (brief §7.5) and are
+ * open-ended per client — see fixtures/clients.json for examples like
+ * "positive_reply", "nurture", "closed_lost". Since hs_lead_status is a
+ * standard HubSpot enumeration property, an arbitrary client-chosen value
+ * needs to exist in its options list before it can be written. Checks and
+ * adds proactively rather than reacting to a write failure, since the
+ * exact error HubSpot returns for an unrecognized enum value on this
+ * property is unconfirmed (see the property constant's own comment).
+ */
+async function ensureLeadStatusOption(cfg: ClientConfig, value: string): Promise<void> {
+  const cacheKey = `${accessToken(cfg)}:${value}`;
+  if (knownLeadStatusOptions.has(cacheKey)) return;
+
+  const getRes = await hubspotFetch(cfg, `/crm/v3/properties/contacts/${HUBSPOT_LEAD_STATUS_PROPERTY}`);
+  if (!getRes.ok) {
     throw new HubspotApiError(
-      res.status,
-      `HubSpot: failed to create ${CYMATE_STATUS_PROPERTY} property: ${hubspotErrorSummary(await res.text())}`,
+      getRes.status,
+      `HubSpot: failed to read ${HUBSPOT_LEAD_STATUS_PROPERTY} property: ${hubspotErrorSummary(await getRes.text())}`,
     );
   }
+  const propertyDef = (await getRes.json()) as { options?: HubspotPropertyOption[] };
+  const options = propertyDef.options ?? [];
+  if (options.some((o) => o.value === value)) {
+    knownLeadStatusOptions.add(cacheKey);
+    return;
+  }
+
+  const patchRes = await hubspotFetch(cfg, `/crm/v3/properties/contacts/${HUBSPOT_LEAD_STATUS_PROPERTY}`, {
+    method: 'PATCH',
+    body: JSON.stringify({
+      options: [...options, { label: value, value, displayOrder: options.length, hidden: false }],
+    }),
+  });
+  // 409 = another concurrent request already added it — not an error.
+  if (!patchRes.ok && patchRes.status !== 409) {
+    throw new HubspotApiError(
+      patchRes.status,
+      `HubSpot: failed to add "${value}" to ${HUBSPOT_LEAD_STATUS_PROPERTY} options: ${hubspotErrorSummary(await patchRes.text())}`,
+    );
+  }
+  knownLeadStatusOptions.add(cacheKey);
 }
 
 /**
@@ -623,26 +669,12 @@ export const hubspotAdapter: CrmAdapter = {
   },
 
   async updateStatus(ref, status, cfg) {
-    const patch = () =>
-      hubspotFetch(cfg, `/crm/v3/objects/contacts/${ref.id}`, {
-        method: 'PATCH',
-        body: JSON.stringify({ properties: { [CYMATE_STATUS_PROPERTY]: status } }),
-      });
+    await ensureLeadStatusOption(cfg, status);
 
-    let res = await patch();
-    if (!res.ok) {
-      const detail = await res.text();
-      if (detail.includes('PROPERTY_DOESNT_EXIST')) {
-        // Self-heals per portal (confirmed necessary live, 25 Aug 2026 — see
-        // file header): the first client on a fresh HubSpot portal always
-        // hits this once, then never again for that portal.
-        logger.info('hubspot: creating missing custom property', { property: CYMATE_STATUS_PROPERTY });
-        await ensureCymateStatusProperty(cfg);
-        res = await patch();
-      } else {
-        throw new HubspotApiError(res.status, `HubSpot updateStatus failed: ${hubspotErrorSummary(detail)}`);
-      }
-    }
+    const res = await hubspotFetch(cfg, `/crm/v3/objects/contacts/${ref.id}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ properties: { [HUBSPOT_LEAD_STATUS_PROPERTY]: status } }),
+    });
     if (!res.ok) {
       throw new HubspotApiError(res.status, `HubSpot updateStatus failed: ${hubspotErrorSummary(await res.text())}`);
     }
