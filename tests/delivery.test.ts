@@ -7,12 +7,14 @@ vi.mock('@/lib/sources/smartlead-api', () => ({
   listCampaignLeads: vi.fn(),
   listLeadMessageHistory: vi.fn(),
   resolveInterestCategoryIds: vi.fn(),
+  resolveCategoryStatusValues: vi.fn(),
 }));
 
 import {
   listCampaignLeads,
   listLeadMessageHistory,
   resolveInterestCategoryIds,
+  resolveCategoryStatusValues,
 } from '@/lib/sources/smartlead-api';
 
 const cfg: ClientConfig = {
@@ -47,9 +49,14 @@ beforeEach(() => {
   vi.mocked(listCampaignLeads).mockReset();
   vi.mocked(listLeadMessageHistory).mockReset();
   vi.mocked(resolveInterestCategoryIds).mockReset();
+  vi.mocked(resolveCategoryStatusValues).mockReset();
   // Default: no history, so tests that don't care about activity backfill
   // don't need to stub it explicitly every time.
   vi.mocked(listLeadMessageHistory).mockResolvedValue([]);
+  // Default: empty map, so tests with a non-empty statusMap that don't care
+  // about category-based status backfill still get the mechanical fallback
+  // rather than an unmocked-call rejection.
+  vi.mocked(resolveCategoryStatusValues).mockResolvedValue(new Map());
 });
 
 describe('deliverCampaignLeads', () => {
@@ -202,6 +209,26 @@ describe('deliverCampaignLeads', () => {
       expect(result.skippedNotInterested).toBe(2);
       expect(await mockAdapter.findRecord('never-replied-bounced@example.com', partialCfg)).toBeNull();
       expect(await mockAdapter.findRecord('not-interested@example.com', partialCfg)).toBeNull();
+    });
+
+    it("writes the client's configured status value for a lead's category, not the mechanical delivered_<sequenceStatus> fallback — real incident regression (28 Aug 2026): a genuinely interested lead delivered via this path showed HubSpot Lead Status \"delivered_completed\" instead of \"positive_reply\", while the same lead via a real-time webhook reply would have gotten the meaningful value", async () => {
+      vi.mocked(resolveInterestCategoryIds).mockResolvedValue(new Map([[1, 'positive_reply']]));
+      vi.mocked(resolveCategoryStatusValues).mockResolvedValue(new Map([[1, 'positive_reply']]));
+      vi.mocked(listCampaignLeads).mockResolvedValue({
+        totalLeads: 1,
+        leads: [
+          { id: 'sl_20', email: 'genuinely-interested@example.com', leadCategoryId: 1, sequenceStatus: 'COMPLETED' },
+        ],
+      });
+
+      const updateStatusSpy = vi.spyOn(mockAdapter, 'updateStatus');
+
+      await deliverCampaignLeads(partialCfg, mockAdapter, 'camp_1', 25);
+
+      expect(updateStatusSpy).toHaveBeenCalledWith(expect.anything(), 'positive_reply', expect.anything());
+      expect(updateStatusSpy).not.toHaveBeenCalledWith(expect.anything(), 'delivered_completed', expect.anything());
+
+      updateStatusSpy.mockRestore();
     });
 
     it('delivers every lead in full mode regardless of category (unchanged behaviour)', async () => {

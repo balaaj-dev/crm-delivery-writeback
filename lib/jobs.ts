@@ -40,6 +40,7 @@ import {
   listCampaignLeads,
   listLeadMessageHistory,
   resolveInterestCategoryIds,
+  resolveCategoryStatusValues,
   type SmartleadLead,
 } from './sources/smartlead-api';
 import { logger, recordEvent } from './log';
@@ -323,6 +324,20 @@ export async function processJobPage(jobId: string, cfg: ClientConfig, adapter: 
     }
   }
 
+  // Same best-effort re-resolve-per-page approach as interestCategoryIds
+  // above, and the same real bug it fixes — see resolveCategoryStatusValues.
+  let categoryStatusValues: Map<number, string> | null = null;
+  if (Object.keys(cfg.statusMap).length > 0) {
+    try {
+      categoryStatusValues = await resolveCategoryStatusValues(cfg.source.apiKey, cfg.statusMap);
+    } catch (err) {
+      logger.warn(
+        'delivery job: could not resolve category status values — status backfill will use the mechanical fallback',
+        { jobId, error: err instanceof Error ? err.message : String(err) },
+      );
+    }
+  }
+
   if (job.processed >= job.targetLeads) {
     job.status = 'completed';
     job.finishedAt = new Date().toISOString();
@@ -390,7 +405,9 @@ export async function processJobPage(jobId: string, cfg: ClientConfig, adapter: 
           isNewRecord = true;
         }
 
-        const statusValue = deliveryStatusValue(lead);
+        const statusValue =
+          (lead.leadCategoryId != null ? categoryStatusValues?.get(lead.leadCategoryId) : undefined) ??
+          deliveryStatusValue(lead);
         if (statusValue) {
           try {
             await adapter.updateStatus(ref, statusValue, cfg);

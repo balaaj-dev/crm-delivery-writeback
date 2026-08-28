@@ -280,6 +280,36 @@ export async function resolveInterestCategoryIds(
 }
 
 /**
+ * Every category's statusMap value, not just the positive_reply/
+ * meeting_booked subset resolveInterestCategoryIds narrows to — used by
+ * delivery (lib/delivery.ts, lib/jobs.ts) to write the *same* status value
+ * the real-time webhook path would (lib/dispatch.ts's step 9), instead of
+ * the mechanical "delivered_<sequenceStatus>" fallback.
+ *
+ * Real bug this fixes (28 Aug 2026, caught by Balaaj inspecting real
+ * HubSpot contacts): delivery always wrote the mechanical value regardless
+ * of the lead's actual category, even for a lead delivery itself already
+ * knew was Interested (evidenced by the deal it created in the same run,
+ * staged correctly) — so a genuinely interested lead's HubSpot "Lead
+ * Status" read "delivered_completed" instead of whatever the client
+ * configured for Interested (e.g. "positive_reply"), while the exact same
+ * lead reached via a real-time webhook reply would have gotten the
+ * meaningful value. Two paths, two different answers for the same lead.
+ */
+export async function resolveCategoryStatusValues(
+  apiKey: string,
+  statusMap: Record<string, string>,
+): Promise<Map<number, string>> {
+  const categories = await listLeadCategories(apiKey);
+  const values = new Map<number, string>();
+  for (const category of categories) {
+    const mapped = statusMap[category.name];
+    if (mapped) values.set(Number(category.id), mapped);
+  }
+  return values;
+}
+
+/**
  * Registers exactly the 7 approved events (brief §6) for a client's entire
  * Smartlead account in one call — not per campaign. Never pass EMAIL_OPEN
  * or EMAIL_LINK_CLICK here — see brief §2.3 and lib/sources/smartlead.ts's

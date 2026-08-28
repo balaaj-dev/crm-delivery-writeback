@@ -29,6 +29,7 @@ import {
   listCampaignLeads,
   listLeadMessageHistory,
   resolveInterestCategoryIds,
+  resolveCategoryStatusValues,
   type SmartleadLead,
 } from './sources/smartlead-api';
 import { logger, recordEvent } from './log';
@@ -186,6 +187,20 @@ export async function deliverCampaignLeads(
     }
   }
 
+  // Best-effort — a failure here falls back to deliveryStatusValue's
+  // mechanical value below, same as before this existed, rather than
+  // failing the whole delivery run over a status-backfill nicety.
+  let categoryStatusValues: Map<number, string> | null = null;
+  if (Object.keys(cfg.statusMap).length > 0) {
+    try {
+      categoryStatusValues = await resolveCategoryStatusValues(cfg.source.apiKey, cfg.statusMap);
+    } catch (err) {
+      logger.warn('delivery: could not resolve category status values — status backfill will use the mechanical fallback', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
   const result: DeliveryResult = {
     campaignId,
     totalLeadsInCampaign: totalLeads,
@@ -240,7 +255,14 @@ export async function deliverCampaignLeads(
       // Best-effort from here — a failure backfilling status/activity
       // shouldn't erase the fact that the contact itself was successfully
       // found/created above.
-      const statusValue = deliveryStatusValue(lead);
+      //
+      // Prefer the client's own configured statusMap value for this lead's
+      // actual category (the same value the real-time webhook path would
+      // write) over the mechanical delivered_<sequenceStatus> fallback —
+      // see resolveCategoryStatusValues for the real bug this fixes.
+      const statusValue =
+        (lead.leadCategoryId != null ? categoryStatusValues?.get(lead.leadCategoryId) : undefined) ??
+        deliveryStatusValue(lead);
       if (statusValue) {
         try {
           await adapter.updateStatus(ref, statusValue, cfg);

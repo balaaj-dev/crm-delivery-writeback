@@ -387,6 +387,33 @@ up to ~6s of latency, but only for a domain this adapter has never seen before �
 resolves on the first, immediate search. All test data across every run in this section (5 contacts,
 8 companies, 5 deals, 5 notes total) was created then deleted from the real portal.
 
+## Live incident — delivery wrote the wrong HubSpot status for interested leads (28 Aug 2026)
+
+Balaaj caught this by inspecting real contacts in HubSpot (Ryan Humphrey, Lou Forges — both
+delivered via Step 10 against a real Interested-mapped category, both with a deal correctly staged
+"Interested"): the contact's `hs_lead_status` read `delivered_completed`, not anything reflecting
+that the lead was actually interested. `lib/delivery.ts`'s `deliverCampaignLeads` (and
+`lib/jobs.ts`'s `processJobPage`, which mirrors it) always wrote the mechanical
+`delivered_<sequenceStatus>` value from `deliveryStatusValue`, regardless of the lead's actual
+category — even though the same function already computes `dealSignal` from that lead's category to
+decide whether to create a deal at all. Two different signals about the same lead, only one of them
+used.
+
+This also meant the two delivery paths disagreed with each other for the exact same lead: a lead
+delivered via Step 10 got `delivered_completed`; the identical lead reaching this app instead via a
+real-time Smartlead webhook reply would have gone through `lib/dispatch.ts`'s step 9, which writes
+`cfg.statusMap[category]` directly — e.g. `positive_reply`, whatever the CSM actually configured in
+the wizard's status-mapping step.
+
+Fixed by adding `resolveCategoryStatusValues` (`lib/sources/smartlead-api.ts`) — the full
+category-id → statusMap-value mapping, not just the positive_reply/meeting_booked subset
+`resolveInterestCategoryIds` narrows to for deal-creation gating. Both `deliverCampaignLeads` and
+`processJobPage` now prefer this value for a lead's actual category over the mechanical fallback,
+which is now only used when the client's statusMap has no entry for that lead's category at all.
+Covered by a new regression test in `tests/delivery.test.ts`. Not yet re-verified against real
+HubSpot data (the two contacts above were created before this fix) — worth a fresh delivery run
+against Outspeak before the Wesley demo to confirm `hs_lead_status` now reads correctly.
+
 ## Unresolved [VERIFY] items — confirm against live vendor docs/accounts before DRY_RUN=false
 
 | Item | Where | Status |
