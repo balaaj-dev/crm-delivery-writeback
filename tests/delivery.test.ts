@@ -6,14 +6,12 @@ import type { ClientConfig } from '@/lib/types';
 vi.mock('@/lib/sources/smartlead-api', () => ({
   listCampaignLeads: vi.fn(),
   listLeadMessageHistory: vi.fn(),
-  resolveInterestCategoryIds: vi.fn(),
   resolveCategoryStatusValues: vi.fn(),
 }));
 
 import {
   listCampaignLeads,
   listLeadMessageHistory,
-  resolveInterestCategoryIds,
   resolveCategoryStatusValues,
 } from '@/lib/sources/smartlead-api';
 
@@ -48,7 +46,6 @@ beforeEach(() => {
   resetMockAdapterState();
   vi.mocked(listCampaignLeads).mockReset();
   vi.mocked(listLeadMessageHistory).mockReset();
-  vi.mocked(resolveInterestCategoryIds).mockReset();
   vi.mocked(resolveCategoryStatusValues).mockReset();
   // Default: no history, so tests that don't care about activity backfill
   // don't need to stub it explicitly every time.
@@ -187,7 +184,7 @@ describe('deliverCampaignLeads', () => {
     };
 
     it('only delivers leads whose live category maps to positive_reply/meeting_booked — real incident regression (Tracie Cranford, 25 Aug 2026): a bounced, never-replied lead was wrongly delivered and marked a Lead', async () => {
-      vi.mocked(resolveInterestCategoryIds).mockResolvedValue(
+      vi.mocked(resolveCategoryStatusValues).mockResolvedValue(
         new Map([
           [1, 'positive_reply'],
           [2, 'meeting_booked'],
@@ -212,7 +209,6 @@ describe('deliverCampaignLeads', () => {
     });
 
     it("writes the client's configured status value for a lead's category, not the mechanical delivered_<sequenceStatus> fallback — real incident regression (28 Aug 2026): a genuinely interested lead delivered via this path showed HubSpot Lead Status \"delivered_completed\" instead of \"positive_reply\", while the same lead via a real-time webhook reply would have gotten the meaningful value", async () => {
-      vi.mocked(resolveInterestCategoryIds).mockResolvedValue(new Map([[1, 'positive_reply']]));
       vi.mocked(resolveCategoryStatusValues).mockResolvedValue(new Map([[1, 'positive_reply']]));
       vi.mocked(listCampaignLeads).mockResolvedValue({
         totalLeads: 1,
@@ -242,14 +238,14 @@ describe('deliverCampaignLeads', () => {
 
       const result = await deliverCampaignLeads(cfg, mockAdapter, 'camp_1', 25); // cfg.mode === 'full'
 
-      expect(resolveInterestCategoryIds).not.toHaveBeenCalled();
+      expect(resolveCategoryStatusValues).not.toHaveBeenCalled();
       expect(result.processed).toBe(2);
       expect(result.created).toBe(2);
       expect(result.skippedNotInterested).toBe(0);
     });
 
     it('refuses to deliver rather than risk over-delivering when the category lookup itself fails', async () => {
-      vi.mocked(resolveInterestCategoryIds).mockRejectedValue(new Error('categories endpoint down'));
+      vi.mocked(resolveCategoryStatusValues).mockRejectedValue(new Error('categories endpoint down'));
       vi.mocked(listCampaignLeads).mockResolvedValue({
         totalLeads: 1,
         leads: [{ id: 'sl_15', email: 'someone@example.com', leadCategoryId: 1 }],

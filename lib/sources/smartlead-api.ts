@@ -18,7 +18,7 @@
  *                read-only, no campaign data modified. Each entry also
  *                carries `lead_category_id` (confirmed live, 25 Aug 2026,
  *                null until Smartlead triages the lead) — this is what
- *                resolveInterestCategoryIds below filters delivery on.
+ *                resolveCategoryStatusValues below filters delivery on.
  *   CONFIRMED    GET /campaigns/{id}/leads/{leadId}/message-history returns
  *                real sent/reply email content { history: [{ type, subject,
  *                email_body, time, open_count, click_count }] }. Verified
@@ -105,7 +105,7 @@ export interface SmartleadLead {
   linkedinUrl?: string;
   /** Raw sequence status (e.g. INPROGRESS, COMPLETED, PAUSED) — Smartlead's own term, not a CRM lifecycle stage. */
   sequenceStatus?: string;
-  /** Smartlead's own lead-category id for this campaign (null until the lead replies/gets triaged) — see resolveInterestCategoryIds. */
+  /** Smartlead's own lead-category id for this campaign (null until the lead replies/gets triaged) — see resolveCategoryStatusValues. */
   leadCategoryId?: number | null;
   /** Company website/domain — Smartlead's own top-level `website` lead field (confirmed live, 26 Aug 2026). */
   domain?: string;
@@ -243,58 +243,49 @@ export async function listLeadCategories(apiKey: string): Promise<SmartleadLeadC
 }
 
 /**
- * Resolves which of a workspace's live Smartlead lead-category IDs count as
- * a genuine interest signal for one client, per that client's own statusMap
- * (brief §7.5) — the same mapping the writeback path already uses to
- * promote a status_change event to positive_reply/meeting_booked (see
- * resolveEffectiveEventType in lib/dispatch.ts). Used by delivery
- * (lib/delivery.ts, lib/jobs.ts) to decide, in partial mode, which leads are
- * even worth creating a CRM contact for.
+ * Every one of a workspace's live Smartlead lead-category IDs mapped to
+ * this client's own statusMap value (brief §7.5) — the same mapping the
+ * writeback path already uses to promote a status_change event to
+ * positive_reply/meeting_booked (see resolveEffectiveEventType in
+ * lib/dispatch.ts). Used by delivery (lib/delivery.ts, lib/jobs.ts) for
+ * two things from one call:
  *
- * Real incident this fixes (25 Aug 2026): partial-mode delivery was
+ *  1. Filtering, in partial mode, which leads are even worth creating a CRM
+ *     contact for — a category mapped to 'positive_reply'/'meeting_booked'
+ *     counts as a genuine interest signal; callers derive that narrower
+ *     set by filtering this map's values themselves (see either caller for
+ *     the exact filter).
+ *  2. Writing the *same* status value the real-time webhook path would
+ *     (lib/dispatch.ts's step 9) for a delivered lead's actual category,
+ *     instead of the mechanical "delivered_<sequenceStatus>" fallback.
+ *
+ * Real incident #1 this fixes (25 Aug 2026): partial-mode delivery was
  * creating a HubSpot contact for every lead in a campaign regardless of
  * category — confirmed against a real Lotus Labs lead (Tracie Cranford)
  * who only ever bounced (never replied) but still got delivered and
  * incorrectly flagged as a positive-reply Lead. This is what
  * `lead.leadCategoryId` (see listCampaignLeads) is filtered against.
  *
- * Returns a Map (not just a Set) as of 27 Aug 2026 — callers need to know
- * *which* of the two signals a given category id maps to now, not just
- * that it's one of them, so delivery can pick the right deal stage
- * (dealStageOnPositiveReply vs dealStageOnMeetingBooked) instead of
- * lumping every deal into one shared stage.
- */
-export async function resolveInterestCategoryIds(
-  apiKey: string,
-  statusMap: Record<string, string>,
-): Promise<Map<number, 'positive_reply' | 'meeting_booked'>> {
-  const categories = await listLeadCategories(apiKey);
-  const ids = new Map<number, 'positive_reply' | 'meeting_booked'>();
-  for (const category of categories) {
-    const mapped = statusMap[category.name];
-    if (mapped === 'positive_reply' || mapped === 'meeting_booked') {
-      ids.set(Number(category.id), mapped);
-    }
-  }
-  return ids;
-}
-
-/**
- * Every category's statusMap value, not just the positive_reply/
- * meeting_booked subset resolveInterestCategoryIds narrows to — used by
- * delivery (lib/delivery.ts, lib/jobs.ts) to write the *same* status value
- * the real-time webhook path would (lib/dispatch.ts's step 9), instead of
- * the mechanical "delivered_<sequenceStatus>" fallback.
- *
- * Real bug this fixes (28 Aug 2026, caught by Balaaj inspecting real
- * HubSpot contacts): delivery always wrote the mechanical value regardless
+ * Real incident #2 (28 Aug 2026, caught by Balaaj inspecting real HubSpot
+ * contacts): delivery always wrote the mechanical status value regardless
  * of the lead's actual category, even for a lead delivery itself already
  * knew was Interested (evidenced by the deal it created in the same run,
  * staged correctly) — so a genuinely interested lead's HubSpot "Lead
  * Status" read "delivered_completed" instead of whatever the client
  * configured for Interested (e.g. "positive_reply"), while the exact same
  * lead reached via a real-time webhook reply would have gotten the
- * meaningful value. Two paths, two different answers for the same lead.
+ * meaningful value.
+ *
+ * This used to be two separate functions (one narrowed to just the
+ * interest-signal subset, one for the full map) — each caller called both,
+ * so every delivery page made this same underlying API request twice.
+ * Merged same day as incident #2's fix, after that redundancy contributed
+ * to real incident #3: 7 campaigns delivering concurrently, several with
+ * thousands of leads (100+ pages each at PAGE_SIZE), each page making this
+ * call twice, hit Smartlead's account-wide 200-requests/minute rate limit
+ * mid-run. lib/jobs.ts also now caches this result on the job record after
+ * the first page instead of re-fetching every page at all — see
+ * DeliveryJob.categoryStatusValuesCache.
  */
 export async function resolveCategoryStatusValues(
   apiKey: string,

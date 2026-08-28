@@ -39,7 +39,6 @@ import type { ClientConfig, CrmAdapter } from './types';
 import {
   listCampaignLeads,
   listLeadMessageHistory,
-  resolveInterestCategoryIds,
   resolveCategoryStatusValues,
   type SmartleadLead,
 } from './sources/smartlead-api';
@@ -85,6 +84,17 @@ export interface DeliveryJob {
   updatedAt: string;
   finishedAt?: string;
   failureReason?: string;
+  /**
+   * Cached result of resolveCategoryStatusValues, keyed by category id as a
+   * string (JSON object keys can't be numbers) — resolved once on this
+   * job's first page and reused on every later page instead of re-calling
+   * Smartlead's categories endpoint per page. Added 28 Aug 2026 after a
+   * real incident: 7 campaigns delivering concurrently, several with
+   * thousands of leads (100+ pages each), each page re-fetching categories
+   * from scratch — a pattern this file's own comment once called "cheap"
+   * — hit Smartlead's 200-requests/minute account-wide limit mid-run.
+   */
+  categoryStatusValuesCache?: Record<string, string>;
 }
 
 function jobFilePath(id: string): string {
@@ -291,20 +301,24 @@ export async function processJobPage(jobId: string, cfg: ClientConfig, adapter: 
   job.status = 'running';
   const dryRun = isDryRun();
 
-  // Same partial-mode interest filter as lib/delivery.ts — see that file's
-  // comment for the real incident (25 Aug 2026) this fixes. Also resolved
-  // in full mode when createDeal is on, since it's now what decides
-  // whether a delivered lead gets a deal too (see below) — full mode
-  // delivers every lead as a contact, but a deal should still only be
-  // created for the ones genuinely marked Interested/Meeting Booked, same
-  // distinction lib/dispatch.ts's own isDealSignal makes for live replies.
-  // Re-resolved every page rather than cached in the job record — one extra
-  // Smartlead API call per page is cheap, and simpler than persisting a Map
-  // across QStash-triggered invocations.
-  let interestCategoryIds: Map<number, 'positive_reply' | 'meeting_booked'> | null = null;
-  if (cfg.mode === 'partial' || cfg.behaviour.createDeal) {
+  // One Smartlead categories fetch produces both the interest-signal
+  // filter (partial mode gating + deal creation) and the full status
+  // backfill map — cached on the job record after the first page and
+  // reused on every later page rather than re-fetched, per
+  // DeliveryJob.categoryStatusValuesCache's own comment (a real
+  // rate-limit incident, 28 Aug 2026, from re-fetching every page across
+  // several concurrent, many-page campaigns).
+  let categoryStatusValues: Map<number, string> | null = null;
+  if (job.categoryStatusValuesCache) {
+    categoryStatusValues = new Map(
+      Object.entries(job.categoryStatusValuesCache).map(([id, value]) => [Number(id), value]),
+    );
+  } else if (cfg.mode === 'partial' || cfg.behaviour.createDeal || Object.keys(cfg.statusMap).length > 0) {
     try {
-      interestCategoryIds = await resolveInterestCategoryIds(cfg.source.apiKey, cfg.statusMap);
+      categoryStatusValues = await resolveCategoryStatusValues(cfg.source.apiKey, cfg.statusMap);
+      job.categoryStatusValuesCache = Object.fromEntries(
+        [...categoryStatusValues].map(([id, value]) => [String(id), value]),
+      );
     } catch (err) {
       if (cfg.mode === 'partial') {
         // Fail safe, not fail open — see lib/delivery.ts's comment.
@@ -315,28 +329,23 @@ export async function processJobPage(jobId: string, cfg: ClientConfig, adapter: 
         return false;
       }
       // Full mode doesn't depend on this for delivery itself — degrade
-      // gracefully by skipping deal creation this run rather than failing
-      // the whole job over a feature that isn't its main job.
-      logger.warn('delivery job: could not resolve interest categories — deal creation will be skipped this run', {
-        jobId,
-        error: err instanceof Error ? err.message : String(err),
-      });
-    }
-  }
-
-  // Same best-effort re-resolve-per-page approach as interestCategoryIds
-  // above, and the same real bug it fixes — see resolveCategoryStatusValues.
-  let categoryStatusValues: Map<number, string> | null = null;
-  if (Object.keys(cfg.statusMap).length > 0) {
-    try {
-      categoryStatusValues = await resolveCategoryStatusValues(cfg.source.apiKey, cfg.statusMap);
-    } catch (err) {
+      // gracefully by skipping deal creation and status backfill this run
+      // rather than failing the whole job over either.
       logger.warn(
-        'delivery job: could not resolve category status values — status backfill will use the mechanical fallback',
+        'delivery job: could not resolve category status values — deal creation and status backfill will be skipped this run',
         { jobId, error: err instanceof Error ? err.message : String(err) },
       );
     }
   }
+
+  const interestCategoryIds: Map<number, 'positive_reply' | 'meeting_booked'> | null = categoryStatusValues
+    ? new Map(
+        [...categoryStatusValues].filter(
+          (entry): entry is [number, 'positive_reply' | 'meeting_booked'] =>
+            entry[1] === 'positive_reply' || entry[1] === 'meeting_booked',
+        ),
+      )
+    : null;
 
   if (job.processed >= job.targetLeads) {
     job.status = 'completed';

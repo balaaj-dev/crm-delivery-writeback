@@ -406,13 +406,42 @@ real-time Smartlead webhook reply would have gone through `lib/dispatch.ts`'s st
 the wizard's status-mapping step.
 
 Fixed by adding `resolveCategoryStatusValues` (`lib/sources/smartlead-api.ts`) — the full
-category-id → statusMap-value mapping, not just the positive_reply/meeting_booked subset
-`resolveInterestCategoryIds` narrows to for deal-creation gating. Both `deliverCampaignLeads` and
-`processJobPage` now prefer this value for a lead's actual category over the mechanical fallback,
-which is now only used when the client's statusMap has no entry for that lead's category at all.
-Covered by a new regression test in `tests/delivery.test.ts`. Not yet re-verified against real
-HubSpot data (the two contacts above were created before this fix) — worth a fresh delivery run
-against Outspeak before the Wesley demo to confirm `hs_lead_status` now reads correctly.
+category-id → statusMap-value mapping, not just the positive_reply/meeting_booked subset needed
+for deal-creation gating. Both `deliverCampaignLeads` and `processJobPage` now prefer this value
+for a lead's actual category over the mechanical fallback, which is now only used when the
+client's statusMap has no entry for that lead's category at all. Covered by a new regression test
+in `tests/delivery.test.ts`. **This fix directly caused the rate-limit incident immediately
+below** — read that one too before assuming this one is fully verified live.
+
+## Live incident — the above fix's own extra API call helped trigger a Smartlead rate limit (28 Aug 2026)
+
+Same day, next thing Balaaj hit while demo-prepping against Outspeak: Step 10 delivering 7
+campaigns concurrently, one with 3277 leads, failed with a real 429 — "You have exceeded the 200
+requests in 1 min limit." Root cause had two layers:
+
+1. **Pre-existing**: `lib/jobs.ts`'s `processJobPage` re-resolved lead categories from Smartlead on
+   *every single page* (at `PAGE_SIZE` leads per page, a 3277-lead campaign is 100+ pages), with a
+   comment at the time calling this "cheap." Fine in isolation; not fine across 7 campaigns
+   delivering concurrently.
+2. **This session's own regression**: the `resolveCategoryStatusValues` fix immediately above was
+   added *alongside* the pre-existing `resolveInterestCategoryIds` call rather than replacing it —
+   both call the same underlying Smartlead categories endpoint, so every page was making the
+   identical request twice. Doubled an already rate-limit-prone pattern.
+
+Fixed by merging the two functions into one (`resolveCategoryStatusValues` now returns everything
+`resolveInterestCategoryIds` used to — callers derive the narrower interest-only view by filtering
+its result themselves) and, more importantly, actually caching it: `lib/jobs.ts` now resolves
+categories once on a job's first page and persists the result on the job record itself
+(`DeliveryJob.categoryStatusValuesCache`), reading it back on every later page instead of
+re-fetching. `lib/delivery.ts`'s single-request path (used by `/api/delivery/run`, not the
+wizard's Step 10) only needed the merge, since it doesn't paginate across separate invocations.
+`resolveInterestCategoryIds` itself is now dead code and was deleted, along with its test mocks in
+`tests/delivery.test.ts` (updated to mock `resolveCategoryStatusValues` directly).
+
+**Not yet re-verified live** — this was diagnosed and fixed from the error message and code
+inspection, not from re-running the failed delivery against Outspeak. Do that before the Wesley
+demo: resume or restart the delivery that hit the 429 and confirm it completes without hitting the
+rate limit again, on top of confirming `hs_lead_status` now reads correctly per the incident above.
 
 ## Unresolved [VERIFY] items — confirm against live vendor docs/accounts before DRY_RUN=false
 

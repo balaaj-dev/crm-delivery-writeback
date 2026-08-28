@@ -28,7 +28,6 @@ import type { CanonicalEvent, ClientConfig, CrmAdapter } from './types';
 import {
   listCampaignLeads,
   listLeadMessageHistory,
-  resolveInterestCategoryIds,
   resolveCategoryStatusValues,
   type SmartleadLead,
 } from './sources/smartlead-api';
@@ -161,17 +160,20 @@ export async function deliverCampaignLeads(
   const { leads, totalLeads } = await fetchAllLeads(cfg.source.apiKey, campaignId, effectiveMax);
   const dryRun = isDryRun();
 
-  // Partial mode's entire premise (see types.ts's MODE_PRESETS comment) is
-  // that a CRM record only gets created on a genuine interest signal — a
-  // real incident (25 Aug 2026, Lotus Labs' Tracie Cranford: bounced, never
-  // replied, still delivered as a Lead) confirmed delivery wasn't actually
-  // enforcing that. Full mode has no such restriction by design. Also
-  // resolved in full mode when createDeal is on — see runJob's identical
-  // comment in lib/jobs.ts, which this mirrors.
-  let interestCategoryIds: Map<number, 'positive_reply' | 'meeting_booked'> | null = null;
-  if (cfg.mode === 'partial' || cfg.behaviour.createDeal) {
+  // One Smartlead categories fetch produces both the interest-signal
+  // filter (partial mode's premise — see types.ts's MODE_PRESETS comment —
+  // a real incident, 25 Aug 2026, Lotus Labs' Tracie Cranford, confirmed
+  // delivery wasn't actually enforcing "interest signal required"; full
+  // mode has no such restriction by design, but resolves this too when
+  // createDeal is on) and the full status backfill map. These used to be
+  // two separate calls to the same underlying endpoint — merged 28 Aug
+  // 2026 after that redundancy contributed to a real Smartlead rate-limit
+  // incident (see lib/jobs.ts's identical fix, which this mirrors, for the
+  // full story).
+  let categoryStatusValues: Map<number, string> | null = null;
+  if (cfg.mode === 'partial' || cfg.behaviour.createDeal || Object.keys(cfg.statusMap).length > 0) {
     try {
-      interestCategoryIds = await resolveInterestCategoryIds(cfg.source.apiKey, cfg.statusMap);
+      categoryStatusValues = await resolveCategoryStatusValues(cfg.source.apiKey, cfg.statusMap);
     } catch (err) {
       if (cfg.mode === 'partial') {
         // Fail safe, not fail open — if we can't verify which categories
@@ -181,25 +183,21 @@ export async function deliverCampaignLeads(
           `Partial-mode delivery needs Smartlead's lead categories to filter for Interested/Meeting Booked leads, and that lookup failed: ${err instanceof Error ? err.message : String(err)}`,
         );
       }
-      logger.warn('delivery: could not resolve interest categories — deal creation will be skipped this run', {
-        error: err instanceof Error ? err.message : String(err),
-      });
+      logger.warn(
+        'delivery: could not resolve category status values — deal creation and status backfill will be skipped this run',
+        { error: err instanceof Error ? err.message : String(err) },
+      );
     }
   }
 
-  // Best-effort — a failure here falls back to deliveryStatusValue's
-  // mechanical value below, same as before this existed, rather than
-  // failing the whole delivery run over a status-backfill nicety.
-  let categoryStatusValues: Map<number, string> | null = null;
-  if (Object.keys(cfg.statusMap).length > 0) {
-    try {
-      categoryStatusValues = await resolveCategoryStatusValues(cfg.source.apiKey, cfg.statusMap);
-    } catch (err) {
-      logger.warn('delivery: could not resolve category status values — status backfill will use the mechanical fallback', {
-        error: err instanceof Error ? err.message : String(err),
-      });
-    }
-  }
+  const interestCategoryIds: Map<number, 'positive_reply' | 'meeting_booked'> | null = categoryStatusValues
+    ? new Map(
+        [...categoryStatusValues].filter(
+          (entry): entry is [number, 'positive_reply' | 'meeting_booked'] =>
+            entry[1] === 'positive_reply' || entry[1] === 'meeting_booked',
+        ),
+      )
+    : null;
 
   const result: DeliveryResult = {
     campaignId,
