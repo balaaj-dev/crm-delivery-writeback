@@ -50,9 +50,9 @@ Cymate's writeback needs to:
   instead of raw IDs (Deals read/write).
 - **List your HubSpot users** so a real person — not a default or whoever happens to be logged
   in — gets assigned as the owner of every contact and deal it creates (Owners read).
-- **Create one small custom property** (`Cymate writeback status`) the first time it runs, to
-  track lifecycle status without touching your existing lifecycle-stage or marketing automation
-  setup (Contact properties/schema read/write).
+- **Add new options to the standard `hs_lead_status` field** the first time a given status value
+  is used, so status updates land on a field every HubSpot account already has instead of asking
+  you to set anything up (Contact properties/schema read/write).
 
 ## If something doesn't work
 
